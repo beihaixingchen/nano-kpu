@@ -1,4 +1,59 @@
-# nano-kpu
+# Nano-KPU RTL Optimization
+
+Personal RTL-optimization fork of [MoonshotAI/nano-kpu](https://github.com/MoonshotAI/nano-kpu).
+The upstream design and its original attribution remain unchanged; this fork
+adds a measured Y73 optimization candidate across seven RTL modules.
+
+## Optimization Results
+
+The campaign explored more than 70 RTL candidates and selected Y73 using
+full-model correctness, full-top Nangate45 ABC timing, simulated cycles per
+token, derived throughput, and mapped logic area.
+
+### Overall improvement
+
+| Metric | Y0 internal baseline | Y73 | Change |
+|---|---:|---:|---:|
+| Full-top Fmax (pre-layout ABC) | 128.6 MHz | 442.923 MHz | +244.4% (3.44x) |
+| Cycles per token | 11,397.083 | 12,029.271 | +5.55% |
+| Derived throughput | 11,283.59 tok/s | 36,820.416 tok/s | +226.3% (3.26x) |
+
+The overall throughput is calculated as `Fmax_MHz * 1,000,000 / cycles_per_token`.
+The early Y0 area report used a different reporting source, so area is compared
+below only against the later same-flow Y53 baseline.
+
+### Same-flow recent comparison
+
+| Metric | Y53 | Y73 | Change |
+|---|---:|---:|---:|
+| Fmax | 429.690 MHz | 442.923 MHz | +3.08% |
+| Cycles per token | 12,025.354 | 12,029.271 | +0.033% |
+| Derived throughput | 35,731.992 tok/s | 36,820.416 tok/s | +3.05% |
+| Mapped logic area | 2.031041 mm2 | 2.050019 mm2 | +0.93% |
+| ABC gates | 1,690,919 | 1,707,772 | +1.00% |
+
+Y73 changes seven core RTL files: `msh_deq.v`, `msh_fetch.v`, `msh_gemv.v`,
+`msh_kda.v`, `msh_mla.v`, `msh_seq.v`, and `msh_vec.v`.
+
+## Correctness Validation
+
+- Full P0 passed for sequence lengths 48 and 16, including exact fixed-point
+  model outputs, logits/argmax, random-reset replay, and latency checks.
+- Strict comparison against the original source passed six deterministic
+  cases: three seed/group-size configurations, each at sequence lengths 48 and
+  16. Input images/layouts, raw output bytes, logits, argmax, and status matched
+  bit-for-bit; both implementations had zero fixed-model logit mismatches.
+- The six-case comparison is deterministic regression evidence, not a formal
+  equivalence proof.
+
+## Metric Scope
+
+Fmax and area are full-top Nangate45 ABC synthesis estimates before placement
+and routing, not silicon or post-route measurements. Mapped logic area excludes
+the SRAM/ROM macros. The reported throughput combines the ABC frequency
+estimate with simulated cycles per token.
+
+## Upstream Project
 
 This repo contains the RTL design of a nano-scale hybrid-architecture
 inference chip, which was designed and implemented fully by Kimi-K3, plus its
