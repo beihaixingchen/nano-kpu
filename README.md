@@ -4,12 +4,12 @@
 
 Personal RTL-optimization fork of [MoonshotAI/nano-kpu](https://github.com/MoonshotAI/nano-kpu).
 The upstream design and its original attribution remain unchanged; this fork
-adds a measured Y73 optimization candidate across seven RTL modules.
+adds the measured V73 optimization candidate across seven RTL modules.
 
 ## Optimization Attribution
 
 Under the project owner's direction, GPT-6 Luna carried out 73 RTL optimization
-iterations (Y1-Y73) starting from the Y0 baseline: generating hypotheses,
+iterations (V1-V73) starting from the V0 baseline: generating hypotheses,
 editing RTL, analyzing simulation/synthesis feedback, and advancing or rejecting
 candidates.
 
@@ -23,13 +23,13 @@ generate the optimization RTL.
 
 ## Optimization Results
 
-The campaign explored more than 70 RTL candidates and selected Y73 using
+The campaign explored more than 70 RTL candidates and selected V73 using
 full-model correctness, full-top Nangate45 ABC timing, simulated cycles per
 token, derived throughput, and mapped logic area.
 
 ### Overall improvement
 
-| Metric | Original campaign baseline (Y0) | Y73 | Change |
+| Metric | Original campaign baseline (V0) | V73 | Change |
 |---|---:|---:|---:|
 | Full-top Fmax (pre-layout ABC) | 128.6 MHz | 442.923 MHz | +244.4% (3.44x) |
 | Cycles per token | 11,397.083 | 12,029.271 | +5.55% |
@@ -37,17 +37,35 @@ token, derived throughput, and mapped logic area.
 | Mapped logic area | 1.754 mm2 | 2.050019 mm2 | +16.9%* |
 | ABC gates | 1,552,365 | 1,707,772 | +10.0% |
 
-Throughput is calculated as `Fmax_MHz * 1,000,000 / cycles_per_token`. Y0 is
+Throughput is calculated as `Fmax_MHz * 1,000,000 / cycles_per_token`. V0 is
 the initial campaign baseline after earlier DEQ/Vec work. The strict functional
 comparison below uses the untouched upstream source commit
 `e1855debc4469dbfa09b18f34dfcdf9ac7b0f949`.
 
-*The Y0 area is from the earlier campaign area report; Y73 uses the full-top
+*The V0 area is from the earlier campaign area report; V73 uses the full-top
 mapped script. Treat the area delta as indicative rather than a strict same-flow
-comparison. Y73 mapped area excludes SRAM/ROM macros.
+comparison. V73 mapped area excludes SRAM/ROM macros.
 
-Y73 changes seven core RTL files: `msh_deq.v`, `msh_fetch.v`, `msh_gemv.v`,
+V73 changes seven core RTL files: `msh_deq.v`, `msh_fetch.v`, `msh_gemv.v`,
 `msh_kda.v`, `msh_mla.v`, `msh_seq.v`, and `msh_vec.v`.
+
+## Key RTL Improvements
+
+These changes accumulated across V0-V73; they were not all made in the final
+iteration:
+
+- **KDA parallelism and overlap:** consume the full 256-bit state word and widen
+  processing from four to eight rows per cycle; overlap pass1 for column `j+1`
+  with pass2 for column `j`; balance reductions and use a sole rotating one-hot
+  bank-write index.
+- **Vector datapath pipelining:** capture the SMIX maximum once per operation,
+  separate SMIX multipliers from EW resource sharing, and pipeline convolution
+  output scaling while keeping its issue stream active.
+- **Fetch/sequencer control:** register the HQ nonempty predicate and simplify
+  descriptor/control selection paths.
+- **Final V73 change:** move the softmax-exp product into an existing LUT-load
+  phase and replace a variable exponent-vector part-select with fixed lane
+  slices. This final retiming adds no cycles per token.
 
 ## Correctness Validation
 
