@@ -13,6 +13,9 @@ iterations (V1-V73) starting from the V0 baseline: generating hypotheses,
 editing RTL, analyzing simulation/synthesis feedback, and advancing or rejecting
 candidates.
 
+The V0-to-V73 optimization campaign took approximately 24 hours of elapsed
+iteration time.
+
 The LLM iteration harness is a documentation-driven protocol made of Markdown
 instructions and tracking records; it does not execute tools automatically. It
 requires a full trace for every candidate: parent version, hypothesis, RTL diff,
