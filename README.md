@@ -2,12 +2,12 @@
 
 **Languages:** English | [简体中文](README_CN.md)
 
-[![Optimizer: GPT-6 Luna](https://img.shields.io/badge/Optimizer-GPT--6_Luna-8957E5?style=for-the-badge)](https://github.com/beihaixingchen)
-[![Iterations: V0-V73](https://img.shields.io/badge/Iterations-V0--V73-2563EB?style=for-the-badge)](#optimization-attribution)
-[![Derived throughput: 36.82K tok/s](https://img.shields.io/badge/Derived_tok%2Fs-36.82K-16A34A?style=for-the-badge)](#optimization-results)
-[![Pre-layout ABC Fmax: 442.923 MHz](https://img.shields.io/badge/ABC_Fmax-442.923_MHz-F97316?style=for-the-badge)](#metric-scope)
-[![Full P0 and six strict cases: passed](https://img.shields.io/badge/Validation-P0_%2B_6_strict_cases-0F766E?style=for-the-badge)](#correctness-validation)
-[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-6B7280?style=for-the-badge)](LICENSE)
+[![Optimizer: GPT-6 Luna](https://img.shields.io/badge/Optimizer-GPT--6_Luna-8957E5?style=flat-square)](https://github.com/beihaixingchen)
+[![Iterations: V0-V73](https://img.shields.io/badge/Iterations-V0--V73-2563EB?style=flat-square)](#optimization-attribution)
+[![Derived throughput: 36.82K tok/s](https://img.shields.io/badge/Derived_tok%2Fs-36.82K-16A34A?style=flat-square)](#optimization-results)
+[![Pre-layout ABC Fmax: 442.923 MHz](https://img.shields.io/badge/ABC_Fmax-442.923_MHz-F97316?style=flat-square)](#metric-scope)
+[![Full P0 and six strict cases: passed](https://img.shields.io/badge/Validation-P0_%2B_6_strict_cases-0F766E?style=flat-square)](#correctness-validation)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-6B7280?style=flat-square)](LICENSE)
 
 Personal RTL-optimization fork of [MoonshotAI/nano-kpu](https://github.com/MoonshotAI/nano-kpu).
 The upstream design and its original attribution remain unchanged; this fork
