@@ -4,6 +4,14 @@ Personal RTL-optimization fork of [MoonshotAI/nano-kpu](https://github.com/Moons
 The upstream design and its original attribution remain unchanged; this fork
 adds a measured Y73 optimization candidate across seven RTL modules.
 
+## Optimization Attribution
+
+Under the project owner's direction, GPT-6 Luna carried out 73 RTL optimization
+iterations (Y1-Y73) starting from the Y0 baseline: generating hypotheses,
+editing RTL, analyzing simulation/synthesis feedback, and advancing or rejecting
+candidates. The harness automated lint, P0, and ABC evaluation; it measured and
+reported results rather than authoring the optimizations.
+
 ## Optimization Results
 
 The campaign explored more than 70 RTL candidates and selected Y73 using
