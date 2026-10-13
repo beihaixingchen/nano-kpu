@@ -1,5 +1,7 @@
 # Nano-KPU RTL 优化项目（中文版）
 
+**语言：** [English](README.md) | 简体中文
+
 这是 [MoonshotAI/nano-kpu](https://github.com/MoonshotAI/nano-kpu) 的个人 RTL
 优化 fork。上游设计及原始归属保持不变；本 fork 发布了覆盖 7 个 RTL 模块的
 Y73 优化候选。
@@ -8,8 +10,11 @@ Y73 优化候选。
 
 在项目负责人提出目标并指导方向下，GPT-6 Luna 以 Y0 为基线，独立执行了 Y1 至
 Y73 共 73 轮 RTL 优化迭代：生成优化假设、修改 RTL、分析仿真/综合反馈，并推进或淘汰候选方案。
-Harness 自动执行 lint、P0 和 ABC 评测，负责测量和反馈；优化方案由模型迭代生成，
-不是评估人员手工完成。
+
+LLM 优化 Harness 是由 Markdown 流程说明和跟踪记录构成的文档规范，不会自动执行工具。
+它要求模型为每个候选保留完整轨迹：父版本、优化假设、RTL 差异、实际命令及结果、
+P0/ABC 指标、关键路径、源文件 hash，以及保留/淘汰/回退决定。GPT-6 Luna 按该规范
+调用仓库 `harness/` 中的脚本，并依据结果推进迭代；这些脚本不负责生成优化 RTL。
 
 ## 优化结果
 

@@ -1,5 +1,7 @@
 # Nano-KPU RTL Optimization
 
+**Languages:** English | [简体中文](README_CN.md)
+
 Personal RTL-optimization fork of [MoonshotAI/nano-kpu](https://github.com/MoonshotAI/nano-kpu).
 The upstream design and its original attribution remain unchanged; this fork
 adds a measured Y73 optimization candidate across seven RTL modules.
@@ -9,8 +11,15 @@ adds a measured Y73 optimization candidate across seven RTL modules.
 Under the project owner's direction, GPT-6 Luna carried out 73 RTL optimization
 iterations (Y1-Y73) starting from the Y0 baseline: generating hypotheses,
 editing RTL, analyzing simulation/synthesis feedback, and advancing or rejecting
-candidates. The harness automated lint, P0, and ABC evaluation; it measured and
-reported results rather than authoring the optimizations.
+candidates.
+
+The LLM iteration harness is a documentation-driven protocol made of Markdown
+instructions and tracking records; it does not execute tools automatically. It
+requires a full trace for every candidate: parent version, hypothesis, RTL diff,
+commands and results, P0/ABC metrics, critical path, source hashes, and the
+keep/reject/restore decision. GPT-6 Luna invoked the repository's `harness/`
+scripts and used their output to drive the next iteration; those scripts do not
+generate the optimization RTL.
 
 ## Optimization Results
 
