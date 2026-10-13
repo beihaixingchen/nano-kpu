@@ -12,25 +12,22 @@ token, derived throughput, and mapped logic area.
 
 ### Overall improvement
 
-| Metric | Y0 internal baseline | Y73 | Change |
+| Metric | Original campaign baseline (Y0) | Y73 | Change |
 |---|---:|---:|---:|
 | Full-top Fmax (pre-layout ABC) | 128.6 MHz | 442.923 MHz | +244.4% (3.44x) |
 | Cycles per token | 11,397.083 | 12,029.271 | +5.55% |
 | Derived throughput | 11,283.59 tok/s | 36,820.416 tok/s | +226.3% (3.26x) |
+| Mapped logic area | 1.754 mm2 | 2.050019 mm2 | +16.9%* |
+| ABC gates | 1,552,365 | 1,707,772 | +10.0% |
 
-The overall throughput is calculated as `Fmax_MHz * 1,000,000 / cycles_per_token`.
-The early Y0 area report used a different reporting source, so area is compared
-below only against the later same-flow Y53 baseline.
+Throughput is calculated as `Fmax_MHz * 1,000,000 / cycles_per_token`. Y0 is
+the initial campaign baseline after earlier DEQ/Vec work. The strict functional
+comparison below uses the untouched upstream source commit
+`e1855debc4469dbfa09b18f34dfcdf9ac7b0f949`.
 
-### Same-flow recent comparison
-
-| Metric | Y53 | Y73 | Change |
-|---|---:|---:|---:|
-| Fmax | 429.690 MHz | 442.923 MHz | +3.08% |
-| Cycles per token | 12,025.354 | 12,029.271 | +0.033% |
-| Derived throughput | 35,731.992 tok/s | 36,820.416 tok/s | +3.05% |
-| Mapped logic area | 2.031041 mm2 | 2.050019 mm2 | +0.93% |
-| ABC gates | 1,690,919 | 1,707,772 | +1.00% |
+*The Y0 area is from the earlier campaign area report; Y73 uses the full-top
+mapped script. Treat the area delta as indicative rather than a strict same-flow
+comparison. Y73 mapped area excludes SRAM/ROM macros.
 
 Y73 changes seven core RTL files: `msh_deq.v`, `msh_fetch.v`, `msh_gemv.v`,
 `msh_kda.v`, `msh_mla.v`, `msh_seq.v`, and `msh_vec.v`.
