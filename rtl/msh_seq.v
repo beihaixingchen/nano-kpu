@@ -242,15 +242,29 @@ module msh_seq (
     // header; all products needed are a <= 2^18 times b <= 2^9)
     // ------------------------------------------------------------
     function [35:0] mul9(input [17:0] a, input [8:0] b);
-        mul9 = (b[0] ? {18'b0, a}        : 36'd0)
-             + (b[1] ? {17'b0, a, 1'b0}  : 36'd0)
-             + (b[2] ? {16'b0, a, 2'b0}  : 36'd0)
-             + (b[3] ? {15'b0, a, 3'b0}  : 36'd0)
-             + (b[4] ? {14'b0, a, 4'b0}  : 36'd0)
-             + (b[5] ? {13'b0, a, 5'b0}  : 36'd0)
-             + (b[6] ? {12'b0, a, 6'b0}  : 36'd0)
-             + (b[7] ? {11'b0, a, 7'b0}  : 36'd0)
-             + (b[8] ? {10'b0, a, 8'b0}  : 36'd0);
+        reg [35:0] p0, p1, p2, p3, p4, p5, p6, p7, p8;
+        reg [35:0] s01, s23, s45, s67;
+        reg [35:0] s03, s47, s07;
+        begin
+            p0 = b[0] ? {18'b0, a}       : 36'd0;
+            p1 = b[1] ? {17'b0, a, 1'b0} : 36'd0;
+            p2 = b[2] ? {16'b0, a, 2'b0} : 36'd0;
+            p3 = b[3] ? {15'b0, a, 3'b0} : 36'd0;
+            p4 = b[4] ? {14'b0, a, 4'b0} : 36'd0;
+            p5 = b[5] ? {13'b0, a, 5'b0} : 36'd0;
+            p6 = b[6] ? {12'b0, a, 6'b0} : 36'd0;
+            p7 = b[7] ? {11'b0, a, 7'b0} : 36'd0;
+            p8 = b[8] ? {10'b0, a, 8'b0} : 36'd0;
+
+            s01 = p0 + p1;
+            s23 = p2 + p3;
+            s45 = p4 + p5;
+            s67 = p6 + p7;
+            s03 = s01 + s23;
+            s47 = s45 + s67;
+            s07 = s03 + s47;
+            mul9 = s07 + p8;
+        end
     endfunction
 
     // ------------------------------------------------------------
@@ -346,12 +360,14 @@ module msh_seq (
     reg        cs;
     reg [4:0]  bs_it;
     reg [17:0] bs_lo, bs_hi;
+    reg [1:0]  bs_phase;
+    reg [17:0] bs_mid_r;
+    reg [63:0] bs_square_r, bs_prod_r;
     reg [16:0] c_att, c_dh;
     wire [19:0] bs_dcur = cs ? {10'b0, cfg_dh} : {2'b0, w_dqk};
     wire [18:0] bs_mid  = ({1'b0, bs_lo} + {1'b0, bs_hi} + 19'd1) >> 1;
     wire [19:0] bs_t    = ({1'b0, bs_mid} << 1) - 20'd1;
     wire [63:0] bs_tt   = {44'b0, bs_t} * {44'b0, bs_t};
-    wire [63:0] bs_prod = bs_tt * {44'b0, bs_dcur};
 
     // ------------------------------------------------------------
     // stream-to-memory staging (startup loads)
@@ -1199,6 +1215,49 @@ module msh_seq (
     assign rsp_valid = (state == S_DONE);
     assign rsp_data  = RSP_DONE;
 
+    // All descriptor-address sources are mutually exclusive FSM events.
+    // Decode them in parallel instead of cascading assignments through the
+    // large layer-program case tree.
+    wire desc_lay_gemv = (state == S_LAY) && (dec_kind == KD_GEMV);
+    wire [12:0] desc_raddr_sel;
+    assign desc_raddr_sel[0]  = (state == S_CACHE) && (cc == 3'd0);
+    assign desc_raddr_sel[1]  = (state == S_CACHE) && (cc == 3'd1);
+    assign desc_raddr_sel[2]  = (state == S_CACHE) && (cc == 3'd2);
+    assign desc_raddr_sel[3]  = (state == S_CACHE) && (cc == 3'd3);
+    assign desc_raddr_sel[4]  = (state == S_CACHE) && (cc == 3'd4);
+    assign desc_raddr_sel[5]  = (state == S_CACHE) && (cc == 3'd5);
+    assign desc_raddr_sel[6]  = (state == S_WALK) && (ws == 3'd0)
+                              && (wst != 5'd3) && (wst != 5'd13)
+                              && (wst != 5'd15);
+    assign desc_raddr_sel[7]  = desc_lay_gemv && (ex == 4'd0)
+                              && !dec_skip && !dec_pre && !hd_valid;
+    assign desc_raddr_sel[8]  = desc_lay_gemv && (ex == 4'd1);
+    assign desc_raddr_sel[9]  = desc_lay_gemv && (ex == 4'd2);
+    assign desc_raddr_sel[10] = desc_lay_gemv && (ex == 4'd9)
+                              && (pf_state == PF_IDLE) && (pf_wantA || pf_wantB);
+    assign desc_raddr_sel[11] = desc_lay_gemv && (ex == 4'd9)
+                              && (pf_state == PF_Q);
+    assign desc_raddr_sel[12] = desc_lay_gemv && (ex == 4'd9)
+                              && (pf_state == PF_S);
+    wire desc_raddr_hold = rst_n && !(|desc_raddr_sel);
+    wire [14:0] desc_raddr_d =
+          ({15{desc_raddr_hold}} & desc_raddr)
+        | ({15{rst_n && desc_raddr_sel[1]}}  & 15'd1)
+        | ({15{rst_n && desc_raddr_sel[2]}}  & 15'd2)
+        | ({15{rst_n && desc_raddr_sel[3]}}  & (cfg_NT - 15'd3))
+        | ({15{rst_n && desc_raddr_sel[4]}}  & (cfg_NT - 15'd2))
+        | ({15{rst_n && desc_raddr_sel[5]}}  & (cfg_NT - 15'd1))
+        | ({15{rst_n && desc_raddr_sel[6]}}  & didx)
+        | ({15{rst_n && desc_raddr_sel[7]}}  & dec_qidx)
+        | ({15{rst_n && desc_raddr_sel[8]}}  & (dec_qidx + 15'd1))
+        | ({15{rst_n && desc_raddr_sel[9]}}  & (dec_qidx + 15'd2))
+        | ({15{rst_n && desc_raddr_sel[10]}} & (pf_wantA ? nx_qidx : nx2_qidx))
+        | ({15{rst_n && desc_raddr_sel[11]}} & (pf_tqidx + 15'd1))
+        | ({15{rst_n && desc_raddr_sel[12]}} & (pf_tqidx + 15'd2));
+
+    always @(posedge clk)
+        desc_raddr <= desc_raddr_d;
+
     // consume intentionally-unused inputs (lint cleanliness)
 `ifdef MSH_DEBUG
     always @(posedge clk) begin
@@ -1349,6 +1408,10 @@ module msh_seq (
             bs_it       <= 5'd0;
             bs_lo       <= 18'd0;
             bs_hi       <= 18'd0;
+            bs_phase    <= 2'd0;
+            bs_mid_r    <= 18'd0;
+            bs_square_r <= 64'd0;
+            bs_prod_r   <= 64'd0;
             c_att       <= 17'd0;
             c_dh        <= 17'd0;
             ld_flat     <= 128'd0;
@@ -1384,7 +1447,6 @@ module msh_seq (
             pl_qlen     <= 32'd0;
             pl_slen     <= 32'd0;
             pl_zlen     <= 32'd0;
-            desc_raddr  <= 15'd0;
         end else begin
             /* verilator lint_off BLKSEQ */
             adv  = 1'b0;
@@ -1491,27 +1553,23 @@ module msh_seq (
                 // cache emb.q/s/z + head.q/s/z descriptor addresses
                 S_CACHE: begin
                     case (cc)
-                        3'd0: begin desc_raddr <= 15'd0;        cc <= 3'd1; end
-                        3'd1: begin desc_raddr <= 15'd1;        cc <= 3'd2; end
+                        3'd0: begin cc <= 3'd1; end
+                        3'd1: begin cc <= 3'd2; end
                         3'd2: begin
                             emb_q_base <= {4'b0, desc_rdata[63:32]};
-                            desc_raddr <= 15'd2;
                             cc <= 3'd3;
                         end
                         3'd3: begin
                             emb_s_base <= {4'b0, desc_rdata[63:32]};
-                            desc_raddr <= cfg_NT - 15'd3;
                             cc <= 3'd4;
                         end
                         3'd4: begin
                             emb_z_base <= {4'b0, desc_rdata[63:32]};
-                            desc_raddr <= cfg_NT - 15'd2;
                             cc <= 3'd5;
                         end
                         3'd5: begin
                             head_q_addr <= {4'b0, desc_rdata[63:32]};
                             head_q_len  <= desc_rdata[95:64];
-                            desc_raddr  <= cfg_NT - 15'd1;
                             cc <= 3'd6;
                         end
                         3'd6: begin
@@ -1571,7 +1629,6 @@ module msh_seq (
                                     wst <= 5'd16;
                                 end
                             end else begin
-                                desc_raddr <= didx;
                                 ws         <= 3'd1;
                             end
                         end
@@ -1661,23 +1718,39 @@ module msh_seq (
                         bs_it <= 5'd0;
                         bs_lo <= 18'd1;
                         bs_hi <= 18'h20000;
+                        bs_phase <= 2'd0;
                     end
                 end
                 // c_att = round(2^16/sqrt(dqk)), c_dh = round(2^16/sqrt(dh))
                 // exact integer binary search (no ties for ladder dims)
                 S_CATT: begin
                     if (bs_it < 5'd18) begin
-                        if (bs_prod <= 64'h0000_0004_0000_0000)
-                            bs_lo <= bs_mid[17:0];
-                        else
-                            bs_hi <= bs_mid[17:0];
-                        bs_it <= bs_it + 5'd1;
+                        case (bs_phase)
+                            2'd0: begin
+                                bs_mid_r    <= bs_mid[17:0];
+                                bs_square_r <= bs_tt;
+                                bs_phase    <= 2'd1;
+                            end
+                            2'd1: begin
+                                bs_prod_r <= bs_square_r * {44'b0, bs_dcur};
+                                bs_phase  <= 2'd2;
+                            end
+                            default: begin
+                                if (bs_prod_r <= 64'h0000_0004_0000_0000)
+                                    bs_lo <= bs_mid_r;
+                                else
+                                    bs_hi <= bs_mid_r;
+                                bs_it    <= bs_it + 5'd1;
+                                bs_phase <= 2'd0;
+                            end
+                        endcase
                     end else if (!cs) begin
                         c_att <= bs_lo[16:0];
                         cs    <= 1'b1;
                         bs_it <= 5'd0;
                         bs_lo <= 18'd1;
                         bs_hi <= 18'h20000;
+                        bs_phase <= 2'd0;
                     end else begin
                         c_dh    <= bs_lo[16:0];
                         state   <= S_WCLR;
@@ -1760,7 +1833,6 @@ module msh_seq (
                                 pl_zlen  <= hd_zlen;
                                 ex       <= 4'd5;
                             end else begin
-                                desc_raddr <= dec_qidx;
                                 ex         <= 4'd1;
                             end
                         end else begin
@@ -1769,13 +1841,11 @@ module msh_seq (
                     end else if (dec_kind == KD_GEMV) begin
                         case (ex)
                             4'd1: begin
-                                desc_raddr <= dec_qidx + 15'd1;
                                 ex         <= 4'd2;
                             end
                             4'd2: begin
                                 pl_qaddr   <= {4'b0, desc_rdata[63:32]};
                                 pl_qlen    <= desc_rdata[95:64];
-                                desc_raddr <= dec_qidx + 15'd2;
                                 ex         <= 4'd3;
                             end
                             4'd3: begin
@@ -1832,22 +1902,17 @@ module msh_seq (
                                         PF_IDLE: begin
                                             if (pf_wantA || pf_wantB) begin
                                                 pf_tgt     <= !pf_wantA;
-                                                desc_raddr <= pf_wantA
-                                                            ? nx_qidx
-                                                            : nx2_qidx;
                                                 pf_state   <= PF_Q;
                                             end else begin
                                                 pf_state <= PF_DONE;
                                             end
                                         end
                                         PF_Q: begin
-                                            desc_raddr <= pf_tqidx + 15'd1;
                                             pf_state   <= PF_S;
                                         end
                                         PF_S: begin
                                             pf_qaddr   <= {4'b0, desc_rdata[63:32]};
                                             pf_qlen    <= desc_rdata[95:64];
-                                            desc_raddr <= pf_tqidx + 15'd2;
                                             pf_state   <= PF_Z;
                                         end
                                         PF_Z: begin
@@ -1913,23 +1978,15 @@ module msh_seq (
                                 if (gv_done) begin
                                     bs_owner <= 1'b0;
                                     if (st == ST_HEAD) begin
-                                        // running argmax folds the final
-                                        // emission beat one cycle after
-                                        // y_done_r: wait one cycle (ex=10)
-                                        ex <= 4'd10;
+                                        // GEMV delays done until argmax commit.
+                                        amx <= gv_am_idx;
+                                        adv = 1'b1;
+                                        ex  <= 4'd0;
                                     end else begin
                                         adv = 1'b1;
                                         ex  <= 4'd0;
                                     end
                                 end
-                            end
-                            4'd10: begin
-                                // ST_HEAD only: latch the argmax one cycle
-                                // after gv_done, once the final beat has
-                                // been folded into the running argmax.
-                                amx <= gv_am_idx;
-                                adv = 1'b1;
-                                ex  <= 4'd0;
                             end
                             default: ex <= 4'd0;
                         endcase

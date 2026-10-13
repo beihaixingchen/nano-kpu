@@ -377,6 +377,10 @@ module msh_gemv #(
     reg [17:0] wr_c;
     reg [31:0] am_val_r;
     reg [17:0] am_idx_r;
+    reg signed [31:0] am_p01_val_r, am_p23_val_r, am_seed_y0_r;
+    reg [17:0] am_p01_idx_r, am_p23_idx_r;
+    reg am_p01_valid_r, am_p23_valid_r, am_seed0_r;
+    reg am_pipe_valid_r, am_pipe_last_r;
     reg [11:0] x_addr_r;
     reg [12:0] seg_pos;             // .q/s/z segment byte position (max 4096)
     // segment-load staging (one word in flight)
@@ -397,7 +401,8 @@ module msh_gemv #(
     reg [15:0]  smac_base_d, smac_r_d;
 
     // ---------------- combinational interface ----------------
-    assign job_ready = (state == S_IDLE);
+    assign job_ready = (state == S_IDLE)
+                    && !(j_mode && (y_we_r || am_pipe_valid_r));
     // head job uses the resident shadow buffer once the fetch holds the
     // whole head weight segment (see msh_fetch TG_HQ). Latched at job
     // accept: fill_done can rise mid-first-job (the shadow fill runs
@@ -666,38 +671,57 @@ module msh_gemv #(
         end
     end
 
-    // combinational argmax scan of the registered emission beat (used by
-    // the S_WRITE block one cycle after y_data_r is registered)
+    // Stage one reduces the registered emission beat into two lane pairs.
     wire [18:0]  am_rem = {1'b0, j_n} - {1'b0, wr_am_base};
+    wire am_v0 = (am_rem > 19'd0);
+    wire am_v1 = (am_rem > 19'd1);
+    wire am_v2 = (am_rem > 19'd2);
+    wire am_v3 = (am_rem > 19'd3);
+    wire signed [31:0] am_y0 = y_data_r[31:0];
+    wire signed [31:0] am_y1 = y_data_r[63:32];
+    wire signed [31:0] am_y2 = y_data_r[95:64];
+    wire signed [31:0] am_y3 = y_data_r[127:96];
+    wire [17:0] am_i0 = wr_am_base;
+    wire [17:0] am_i1 = wr_am_base + 18'd1;
+    wire [17:0] am_i2 = wr_am_base + 18'd2;
+    wire [17:0] am_i3 = wr_am_base + 18'd3;
+    wire am_p01_valid = am_v0 || am_v1;
+    wire signed [31:0] am_p01_val =
+        !am_v0 ? am_y1 : !am_v1 ? am_y0 :
+        (am_y1 > am_y0 ? am_y1 : am_y0);
+    wire [17:0] am_p01_idx =
+        !am_v0 ? am_i1 : !am_v1 ? am_i0 :
+        (am_y1 > am_y0 ? am_i1 : am_i0);
+    wire am_p23_valid = am_v2 || am_v3;
+    wire signed [31:0] am_p23_val =
+        !am_v2 ? am_y3 : !am_v3 ? am_y2 :
+        (am_y3 > am_y2 ? am_y3 : am_y2);
+    wire [17:0] am_p23_idx =
+        !am_v2 ? am_i3 : !am_v3 ? am_i2 :
+        (am_y3 > am_y2 ? am_i3 : am_i2);
+    wire am_seed0 = am_v0 && (wr_am_base == 18'd0);
+    wire am_pipe_lanes_valid = am_p01_valid_r || am_p23_valid_r;
+    wire signed [31:0] am_pipe_lane_max =
+        !am_p01_valid_r ? am_p23_val_r : !am_p23_valid_r ? am_p01_val_r :
+        (am_p23_val_r > am_p01_val_r ? am_p23_val_r : am_p01_val_r);
+    wire [17:0] am_pipe_lane_idx =
+        !am_p01_valid_r ? am_p23_idx_r : !am_p23_valid_r ? am_p01_idx_r :
+        (am_p23_val_r > am_p01_val_r ? am_p23_idx_r : am_p01_idx_r);
+    wire signed [31:0] am_seed_val =
+        am_seed0_r ? am_seed_y0_r : $signed(am_val_r);
+    wire [17:0] am_seed_idx = am_seed0_r ? 18'd0 : am_idx_r;
     reg [31:0]  am_bv;
     reg [17:0]  am_bi;
     always @* begin
-        am_bv = am_val_r;
-        am_bi = am_idx_r;
-        if ((am_rem > 19'd0)
-            && ((wr_am_base == 18'd0)
-                || ($signed(y_data_r[31:0]) > $signed(am_bv)))) begin
-            am_bv = y_data_r[31:0];
-            am_bi = wr_am_base;
-        end
-        if ((am_rem > 19'd1)
-            && ($signed(y_data_r[63:32]) > $signed(am_bv))) begin
-            am_bv = y_data_r[63:32];
-            am_bi = wr_am_base + 18'd1;
-        end
-        if ((am_rem > 19'd2)
-            && ($signed(y_data_r[95:64]) > $signed(am_bv))) begin
-            am_bv = y_data_r[95:64];
-            am_bi = wr_am_base + 18'd2;
-        end
-        if ((am_rem > 19'd3)
-            && ($signed(y_data_r[127:96]) > $signed(am_bv))) begin
-            am_bv = y_data_r[127:96];
-            am_bi = wr_am_base + 18'd3;
+        am_bv = am_seed_val;
+        am_bi = am_seed_idx;
+        if (am_pipe_lanes_valid && (am_pipe_lane_max > am_seed_val)) begin
+            am_bv = am_pipe_lane_max;
+            am_bi = am_pipe_lane_idx;
         end
     end
 
-    reg        y_we_r, y_done_r, am_valid_r;
+    reg        y_we_r, y_last_r, y_done_r, am_valid_r;
     reg [11:0] y_addr_r;
     reg [127:0] y_data_r;
     reg [3:0]  y_wstrb_r;
@@ -724,7 +748,7 @@ module msh_gemv #(
                      a_kfull[17:5], f_sz64[63:24]};
 
     // ---------------- sequential process ----------------
-    integer i, jj;
+    integer i, jj, cf_bank;
     // aligner temps (blocking, single-cycle lifetime, parallel structure)
     reg [4:0]   a_sum;                  // fill + ws_count (0..31)
     reg [17:0]  a_kfull;                // j_n - row_bcnt
@@ -826,6 +850,16 @@ module msh_gemv #(
             wr_am_base <= 18'd0;
             am_val_r <= 32'h80000000;
             am_idx_r <= 18'd0;
+            am_p01_val_r <= 32'sd0;
+            am_p23_val_r <= 32'sd0;
+            am_seed_y0_r <= 32'sd0;
+            am_p01_idx_r <= 18'd0;
+            am_p23_idx_r <= 18'd0;
+            am_p01_valid_r <= 1'b0;
+            am_p23_valid_r <= 1'b0;
+            am_seed0_r <= 1'b0;
+            am_pipe_valid_r <= 1'b0;
+            am_pipe_last_r <= 1'b0;
             x_addr_r <= 12'd0;
             seg_pos  <= 13'd0;
             ld_stage <= 128'd0;
@@ -836,8 +870,11 @@ module msh_gemv #(
             hf_wait  <= 1'b0;
             smac_dv  <= 1'b0;
             y_we_r     <= 1'b0;
+            y_last_r   <= 1'b0;
             y_done_r   <= 1'b0;
             am_valid_r <= 1'b0;
+            am_pipe_valid_r <= 1'b0;
+            am_pipe_last_r <= 1'b0;
             y_addr_r   <= 12'd0;
             y_data_r   <= 128'd0;
             y_wstrb_r  <= 4'd0;
@@ -1042,30 +1079,37 @@ module msh_gemv #(
             if (smac_dv) begin
                 // small-N inject: row data returned from qram (issued
                 // one cycle earlier by smac_issue)
-                cf_row_v[16*cf_wr +: 16] <= smac_r_d;
-                cf_col_v[18*cf_wr +: 18] <= 18'd0;
-                cf_cnt_v[5*cf_wr +: 5]   <= {1'b0, j_n[3:0]};
                 q16 = {qr_hi, qr_lo} >> {smac_base_d[3:0], 3'b000};
-                for (i = 0; i < 16; i = i + 1)
-                    cf_dat_v[128*cf_wr + 8*i +: 8] <=
-                        ({14'b0, i[3:0]} < j_n)
-                        ? q16[8*i +: 8] : 8'd0;
+                for (cf_bank = 0; cf_bank < 8; cf_bank = cf_bank + 1) begin
+                    if (cf_wr == cf_bank[2:0]) begin
+                        cf_row_v[16*cf_bank +: 16] <= smac_r_d;
+                        cf_col_v[18*cf_bank +: 18] <= 18'd0;
+                        cf_cnt_v[5*cf_bank +: 5]   <= {1'b0, j_n[3:0]};
+                        for (i = 0; i < 16; i = i + 1)
+                            cf_dat_v[128*cf_bank + 8*i +: 8] <=
+                                ({14'b0, i[3:0]} < j_n)
+                                ? q16[8*i +: 8] : 8'd0;
+                    end
+                end
                 cf_wr  <= cf_wr + 3'd1;
                 cf_occ <= cf_occ + 4'd1 - {1'b0, a_pop};
                 if (a_load) cf_rd <= cf_rd + a_pop;
             end else begin
-                if (e1_v) begin
-                    cf_row_v[16*cf_wr +: 16] <= e1_row;
-                    cf_col_v[18*cf_wr +: 18] <= e1_col;
-                    cf_cnt_v[5*cf_wr +: 5]   <= e1_cnt;
-                    cf_dat_v[128*cf_wr +: 128] <= e1_dat;
-                end
                 cf_wr2 = cf_wr + {2'b0, e1_v};
-                if (e2_v) begin
-                    cf_row_v[16*cf_wr2 +: 16] <= e2_row;
-                    cf_col_v[18*cf_wr2 +: 18] <= e2_col;
-                    cf_cnt_v[5*cf_wr2 +: 5]   <= e2_cnt;
-                    cf_dat_v[128*cf_wr2 +: 128] <= e2_dat;
+                // Static bank slices avoid variable-index FIFO writes.
+                for (cf_bank = 0; cf_bank < 8; cf_bank = cf_bank + 1) begin
+                    if (e1_v && (cf_wr == cf_bank[2:0])) begin
+                        cf_dat_v[128*cf_bank +: 128] <= e1_dat;
+                        cf_row_v[16*cf_bank +: 16] <= e1_row;
+                        cf_col_v[18*cf_bank +: 18] <= e1_col;
+                        cf_cnt_v[5*cf_bank +: 5]   <= e1_cnt;
+                    end
+                    if (e2_v && (cf_wr2 == cf_bank[2:0])) begin
+                        cf_dat_v[128*cf_bank +: 128] <= e2_dat;
+                        cf_row_v[16*cf_bank +: 16] <= e2_row;
+                        cf_col_v[18*cf_bank +: 18] <= e2_col;
+                        cf_cnt_v[5*cf_bank +: 5]   <= e2_cnt;
+                    end
                 end
 `ifdef MSH_DEBUG
                 if ((e1_v || e2_v) && (state == S_RUN))
@@ -1344,8 +1388,10 @@ module msh_gemv #(
             // -------- WRITE: y = sat32((acc + 2^(R-1)) >> R), 4/cycle --------
             // pulse defaults (single-cycle outputs)
             y_we_r     <= 1'b0;
+            y_last_r   <= 1'b0;
             y_done_r   <= 1'b0;
             am_valid_r <= 1'b0;
+            am_pipe_valid_r <= 1'b0;
             if (state == S_WRITE) begin
                 if (wr_ph == 2'd0) begin
                     // issue the read of acc word 0 (aw_raddr comb = 0)
@@ -1357,11 +1403,11 @@ module msh_gemv #(
                 end else begin
                     // emission beat: 4 lanes of wr_word
                     y_we_r     <= 1'b1;
+                    y_last_r   <= wr_last;
                     y_addr_r   <= wr_c[11:0];
                     y_data_r   <= y_dat_c;
                     y_wstrb_r  <= wr_strb;
-                    y_done_r   <= wr_last;
-                    am_valid_r <= j_mode;
+                    y_done_r   <= wr_last && !j_mode;
                     wr_am_base <= wr_c;
                     wr_c       <= wr_c + 18'd4;
                     wr_sub     <= wr_sub + 2'd1;
@@ -1373,13 +1419,25 @@ module msh_gemv #(
                         state <= S_IDLE;
                 end
             end
-            // running argmax over the registered emission beat (one cycle
-            // after y_data_r, same lag as before widening; strictly-
-            // greater => lowest-index tie; lane 0 of the first beat seeds
-            // unconditionally since a logit can be INT32_MIN)
-            if (y_we_r && j_mode) begin
+            // Commit the previous beat while staging the next one.
+            if (am_pipe_valid_r) begin
                 am_val_r <= am_bv;
                 am_idx_r <= am_bi;
+                am_valid_r <= 1'b1;
+                if (am_pipe_last_r)
+                    y_done_r <= 1'b1;
+            end
+            if (y_we_r && j_mode) begin
+                am_p01_val_r <= am_p01_val;
+                am_p23_val_r <= am_p23_val;
+                am_p01_idx_r <= am_p01_idx;
+                am_p23_idx_r <= am_p23_idx;
+                am_p01_valid_r <= am_p01_valid;
+                am_p23_valid_r <= am_p23_valid;
+                am_seed0_r <= am_seed0;
+                am_seed_y0_r <= am_y0;
+                am_pipe_valid_r <= 1'b1;
+                am_pipe_last_r <= y_last_r;
             end
 
 `ifdef MSH_DEBUG
@@ -1392,7 +1450,7 @@ module msh_gemv #(
             dbg_state_d <= state;
 `endif
             // -------- job accept --------
-            if ((state == S_IDLE) && job_valid) begin
+            if (job_ready && job_valid) begin
                 j_mode   <= job_mode;
                 hq_use_r <= job_mode && hq_fill_done;
                 j_k2     <= {1'b0, job_K[15:1]};
@@ -1431,6 +1489,9 @@ module msh_gemv #(
                 wr_am_base <= 18'd0;
                 am_val_r <= 32'h80000000;
                 am_idx_r <= 18'd0;
+                am_pipe_valid_r <= 1'b0;
+                am_pipe_last_r <= 1'b0;
+                y_last_r <= 1'b0;
                 seg_pos  <= 13'd0;
                 ld_stage <= 128'd0;
                 ld_flush <= 1'b0;

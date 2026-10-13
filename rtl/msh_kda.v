@@ -19,10 +19,8 @@
 // head at a time: preload q/k/v/alpha + beta from XBUF (2 read ports,
 // 128b words, 1-cycle latency), bk once per head, then per column j a
 // pass1 (accumulate kS, stash Sd) / pass2 (rank-1 update + writeback,
-// accumulate o) over the S column 8 rows/word, FOUR rows per cycle
-// (two sub-beats per 256b word — halves the datapath area vs the
-// 8-lane version at ~2x the pass cycles; the word's two halves are
-// consumed on consecutive cycles). The per-column pass1/pass2 run as a
+// accumulate o) over the S column 8 rows/word, EIGHT rows per cycle. The
+// per-column pass1/pass2 run as a
 // software pipeline (ST_PRIME/ST_PIPE/ST_DRAIN): pass1 for column j+1
 // (S read port) overlaps pass2 for column j (S write port) — the two
 // never address the same column; Sd/u are ping-ponged by column parity
@@ -32,16 +30,15 @@
 //
 // S state lives in a harness msh_sram macro (macros_only rule; sync read,
 // 256b words = 8 rows/word). Compact dynamic addressing: word index =
-// hd*(dh*dh/8) + col*(dh/8) + wb/2 (strides from the job descriptor; the
+// hd*(dh*dh/8) + col*(dh/8) + wb (strides from the job descriptor; the
 // nano config — 1 KDA layer, 2 heads, dh 32 — uses 256 of the 256 words).
-// pass2 writes each word in two half-word strobed beats (sb selects the
-// 128b half). Cleared by a reset write-loop (randreset gate). A
+// pass2 writes each complete 256b word in one strobed beat. Cleared by a
+// reset write-loop (randreset gate). A
 // 2-cycle-latency debug read port (s_dbg_*) exposes the state to the unit
 // TB; it is only sampled while idle. All per-head buffers are packed
 // vectors (no $mem). pass1 is retimed around the 1-cycle macro read: the
 // word address is issued every cycle and the returned word is consumed
-// one cycle later with the delayed sub-beat index p1_rw (initiation
-// interval 1; the odd sub-beat re-reads the same word).
+// one cycle later with the delayed word index p1_rw (initiation interval 1).
 //
 // Documented assumptions:
 //   * dh is a multiple of 4, 32 <= dh <= 128; H <= 4; one KDA layer.
@@ -95,9 +92,10 @@ module msh_kda (
     localparam ST_LOAD  = 4'd3;         // stream q/v (port0), k/alpha (port1)
     localparam ST_BK    = 4'd4;         // bk[i] = rs(beta*kh[i], 24)
     localparam ST_PRIME = 4'd5;         // pass1 for column 0 (pipeline fill)
-    localparam ST_PIPE  = 4'd6;         // steady: pass1(col+1) || pass2(col)
-    localparam ST_DRAIN = 4'd7;         // pass2 for the last column
     localparam ST_DONE  = 4'd8;
+    localparam ST_P1_FLUSH = 4'd9;       // drain registered pass1 results
+    localparam ST_PIPE     = 4'd10;      // pass1 next column + pass2 current
+    localparam ST_PIPE_DRAIN = 4'd11;
 
     reg [3:0] state;
 
@@ -114,16 +112,61 @@ module msh_kda (
     reg [3:0]  hd;                      // current head (0..3)
     reg [8:0]  col;                     // pass2 column j
     reg [8:0]  col_p1;                  // pass1 column (runs one ahead)
-    reg [5:0]  wb;                      // pass2 sub-beat within column
-    reg [5:0]  p1_wb;                   // pass1 issue counter
-    reg [5:0]  p1_rw;                   // pass1: sub-beat of returned data
+    reg [3:0]  wb_bank_sel;             // one-hot pass2 word/bank state
+    wire [1:0] wb;
+    assign wb = {wb_bank_sel[2] | wb_bank_sel[3],
+                 wb_bank_sel[1] | wb_bank_sel[3]};
+    reg [5:0]  p1_wb;                   // pass1 issue word counter
+    reg [5:0]  p1_rw;                   // pass1: word index of returned data
     reg        p1_dv;                   // pass1: returned-data valid
+    reg        p1_pipe_en;              // next-column pass1 active during pass2
     reg signed [31:0] beta_r;
     reg signed [55:0] u_r;              // u of even columns
     reg signed [55:0] u_o_r;            // u of odd columns
     reg signed [71:0] acc_kS;
     reg signed [71:0] acc_o;
     reg [14:0] clr;                     // clear sweep counter
+    reg [17:0] s_dbg_addr_r;
+
+    // Pass2 streaming pipeline. One eight-row word is accepted each
+    // active cycle; tags keep the delayed SRAM/XBUF writes aligned.
+    reg p2_valid0, p2_valid1, p2_valid2, p2_valid3;
+    reg p2_valid4, p2_valid5, p2_valid6, p2_valid7;
+    reg [27:0] p2_tag0, p2_tag1, p2_tag2, p2_tag3;
+    reg [27:0] p2_tag4, p2_tag5, p2_tag6, p2_tag7;
+    reg [351:0] p2_bk_r0;
+    reg signed [55:0] p2_u_r0;
+    reg [271:0] p2_sd_r0;
+    reg [271:0] p2_sd_r1;
+    reg [255:0] p2_q_r0, p2_q_r1, p2_q_r2;
+    reg signed [575:0] p2_update_r1;
+    reg [255:0] p2_state_r2, p2_pn4_r2;
+    reg signed [527:0] p2_qprod_r3;
+    reg signed [79:0] p2_acc_r4;
+    reg signed [56:0] p2_o1_r5;
+    reg signed [58:0] p2_o2_r6;
+    reg [31:0] p2_out_r7;
+
+    reg p1_valid0, p1_valid1, p1_valid2, p1_valid3;
+    reg p1_valid4, p1_valid5, p1_valid6, p1_valid7;
+    reg [8:0] p1_tag0, p1_tag1, p1_tag2, p1_tag3;
+    reg [8:0] p1_tag4, p1_tag5, p1_tag6, p1_tag7;
+    reg [255:0] p1_s_r0, p1_a_r0, p1_k_r0;
+    reg signed [31:0] p1_v_r0, p1_v_r1, p1_v_r2, p1_v_r3;
+    reg signed [31:0] p1_v_r4, p1_v_r5, p1_v_r6;
+    reg [511:0] p1_mul_r1;
+    reg [255:0] p1_k_r1, p1_k_r2;
+    reg [271:0] p1_sd_r2;
+    reg [239:0] p1_sd4_r2;
+    reg [527:0] p1_prod_r3;
+    reg signed [79:0] p1_acc_r4;
+    reg signed [79:0] p1_pair01_r4, p1_pair23_r4;
+    reg signed [79:0] p1_pair45_r4, p1_pair67_r4;
+    reg signed [79:0] p1_sum0123_r5, p1_sum4567_r5;
+    reg signed [79:0] p1_sumall_r6;
+
+    // pass2's u for the current column (odd/even ping-pong with pass1)
+    wire signed [55:0] t2_u = col[0] ? u_o_r : u_r;
 
     // ---------------- XBUF stream loaders ----------------
     reg       p0_ph, p1_ph;             // 0 = first tensor, 1 = second
@@ -144,22 +187,21 @@ module msh_kda (
     wire [12:0] s_hdspan = {5'b0, j_dh[7:0]} * {1'b0, j_sw[4:0]};
     wire [12:0] s_ridx   = ({11'b0, hd[1:0]} * s_hdspan)
                          + ({6'b0, col_p1[6:0]} * {1'b0, j_sw[4:0]})
-                         + {11'b0, p1_wb[2:1]};
+                         + {7'b0, p1_wb};
     wire [12:0] s_widx   = ({11'b0, hd[1:0]} * s_hdspan)
                          + ({6'b0, col[6:0]} * {1'b0, j_sw[4:0]})
-                         + {11'b0, wb[2:1]};
-    wire [6:0]   s_nsb   = ({1'b0, j_sw} << 1);     // sub-beats per pass
-    // pass2 sub-beat fires this cycle: in ST_PIPE it is staggered one
-    // cycle behind pass1's issue (p1_wb != 0), so both passes finish
-    // the window on the same cycle
-    wire         p2_fire = (state == ST_DRAIN)
-                        || ((state == ST_PIPE) && (p1_wb != 6'd0));
-    wire         s_we    = (state == ST_CLEAR) || p2_fire;
-    wire [7:0]   s_waddr = (state == ST_CLEAR) ? clr[7:0] : s_widx[7:0];
-    wire [255:0] s_wd    = (state == ST_CLEAR) ? 256'd0 : {2{p2_word}};
-    wire [31:0]  s_wstrb = (state == ST_CLEAR) ? {32{1'b1}}
-                         : wb[0] ? 32'hFFFF0000 : 32'h0000FFFF;
-    wire [7:0]   s_raddr = ((state == ST_PRIME) || (state == ST_PIPE))
+                         + {11'b0, wb};
+    wire [6:0]   s_nsb   = {1'b0, j_sw};             // words per pass
+    // A complete 256-bit SRAM word is consumed each active cycle.
+    wire         p1_active = (state == ST_PRIME)
+                          || ((state == ST_PIPE) && p1_pipe_en
+                              && ({1'b0, p1_wb} < {1'b0, s_nsb}));
+    wire         p2_fire = (state == ST_PIPE);
+    wire         s_we    = (state == ST_CLEAR) || p2_valid2;
+    wire [7:0]   s_waddr = (state == ST_CLEAR) ? clr[7:0] : p2_tag2[7:0];
+    wire [255:0] s_wd    = (state == ST_CLEAR) ? 256'd0 : p2_state_r2;
+    wire [31:0]  s_wstrb = {32{1'b1}};
+    wire [7:0]   s_raddr = p1_active
                          ? s_ridx[7:0] : s_dbg_addr_r[10:3];
     wire [255:0] s_rd;
     msh_sram #(.DEPTH(256), .WIDTH(256)) u_smem (
@@ -176,8 +218,6 @@ module msh_kda (
     reg [1407:0] bbuf_v;                // 32 x int44 (bk, Q2.28 signed)
     reg [1087:0] sdbuf_v;               // 32 x int34 (Sd of even column)
     reg [1087:0] sdbuf_o_v;             // 32 x int34 (Sd of odd column)
-
-    reg [17:0] s_dbg_addr_r;
 
     // ---------------- helpers ----------------
     function signed [79:0] rs80(input signed [79:0] v, input [6:0] r);
@@ -209,8 +249,8 @@ module msh_kda (
                     : (state == ST_LOAD)           ? {j_abuf, ld_p1}
                     : 13'd0;
 
-    // per-sub-beat pass1 / pass2 arithmetic (4 rows per cycle; row index
-    // within the column = wb*4 + l, half-word of the S word by wb[0]).
+    // Per-word pass1 / pass2 arithmetic (8 rows per cycle; row index
+    // within the column = wb*8 + l).
     // ST_PIPE evaluates BOTH passes every cycle -> separate temps.
     // Datapath temps at TRUE value widths (documented ranges in the
     // header): multiplier operands stay narrow+equal so yosys doesn't
@@ -220,86 +260,135 @@ module msh_kda (
     reg signed [33:0] t_sd;             // rs(alpha*S, 26)
     reg signed [29:0] t_sd4;            // rs(t_sd, 4)
     reg signed [65:0] t_prod;
-    reg signed [79:0] t_acc;
     reg signed [43:0] t_bk;             // rs(beta*k, 24)
-    // pass2 temps
-    reg signed [31:0] t2_pn4;           // rs(S_new, 4)
-    reg signed [43:0] t2_bk;
-    reg signed [71:0] t2_upd;
-    reg signed [72:0] t2_new;
-    reg signed [65:0] t2_prod;
-    reg signed [79:0] t2_acc;
-    reg signed [33:0] t2_sd;
-    reg signed [56:0] t_o1;
-    reg signed [58:0] t_o2;
-    reg [31:0]        t_sat;
-    reg signed [79:0] p1_acc_n, p1_u_n, p2_acc_n;
-    reg [135:0]       p1_sd_v;          // 4 x int34 (comb temp)
-    reg [175:0]       bk_lane_v;        // 4 x int44 (comb temp)
-    reg [127:0]       p2_word;          // 4 x int32 (sub-beat result)
-    reg signed [31:0] p2_o;
+    reg signed [79:0] p1_acc_n, p1_u_n;
+    reg [271:0]       p1_sd_v;          // 8 x int34 (comb temp)
+    reg [351:0]       bk_lane_v;        // 8 x int44 (comb temp)
+    reg [527:0]       p1_prod_v;        // 8 x signed int66 products
+    reg signed [79:0] p1_acc_base, p1_pair01, p1_pair23;
+    reg signed [79:0] p1_pair45, p1_pair67;
+    reg signed [79:0] p1_sum0123, p1_sum4567, p1_sumall;
+    integer p1_l;
+    integer p1_cap_i;
+    reg [511:0] p1_mul_next;
+    reg [239:0] p1_sd4_next;
+    integer p2_l;
+    integer p2_cap_i;
+    reg signed [72:0] p2_new;
+    reg [31:0] p2_sat;
+    reg signed [65:0] p2_prod;
+    reg [575:0] p2_update_next;
+    reg [255:0] p2_state_next, p2_pn4_next;
+    reg [527:0] p2_qprod_next;
+    reg signed [79:0] p2_acc_base, p2_pair01, p2_pair23, p2_acc_n;
+    reg signed [79:0] p2_pair45, p2_pair67;
+    reg signed [56:0] p2_o1_next;
+    reg signed [79:0] p2_o2_next;
+    reg [31:0] p2_out_next;
 
     // rs80/sat32 return 80 bits; assignments to the true-width temps
     // intentionally truncate/extend (values always fit)
     /* verilator lint_off WIDTHTRUNC */
     /* verilator lint_off WIDTHEXPAND */
     always @* begin
-        // ---- bk lanes (ST_BK), 4 rows this sub-beat ----
-        for (l = 0; l < 4; l = l + 1) begin
-            t_a = kbuf_v[32*{wb[2:0], l[1:0]} +: 32];
+        // ---- bk lanes (ST_BK), 8 rows in this SRAM word ----
+        for (l = 0; l < 8; l = l + 1) begin
+            t_a = kbuf_v[32*({wb, l[2:0]}) +: 32];
             t_bk = rs80(beta_r * t_a, 7'd24);
             bk_lane_v[44*l +: 44] = t_bk[43:0];
         end
-        // ---- pass1: Sd, Sd4, kS (consumes returned macro data) ----
-        t_acc = (p1_rw == 6'd0) ? 80'sd0 : {{8{acc_kS[71]}}, acc_kS};
-        for (l = 0; l < 4; l = l + 1) begin
-            t_s   = p1_rw[0] ? s_rd[128+32*l +: 32] : s_rd[32*l +: 32];
-            t_a   = abuf_v[32*{p1_rw[2:0], l[1:0]} +: 32];
-            t_sd  = rs80(t_a * t_s, 7'd26);
-            p1_sd_v[34*l +: 34] = t_sd[33:0];
+    end
+
+    always @* begin
+        for (p1_l = 0; p1_l < 8; p1_l = p1_l + 1)
+            p1_mul_next[64*p1_l +: 64] =
+                $signed(p1_a_r0[32*p1_l +: 32])
+              * $signed(p1_s_r0[32*p1_l +: 32]);
+
+        for (p1_l = 0; p1_l < 8; p1_l = p1_l + 1) begin
+            t_sd = rs80($signed(p1_mul_r1[64*p1_l +: 64]), 7'd26);
+            p1_sd_v[34*p1_l +: 34] = t_sd[33:0];
             t_sd4 = rs80(t_sd, 7'd4);
-            t_prod = $signed(kbuf_v[32*{p1_rw[2:0], l[1:0]} +: 32])
-                     * $signed({{4{t_sd4[29]}}, t_sd4});
-            t_acc = t_acc + {{14{t_prod[65]}}, t_prod};
+            p1_sd4_next[30*p1_l +: 30] = t_sd4[29:0];
         end
-        p1_acc_n = t_acc;
-        p1_u_n = ({{48{vbuf_v[32*col_p1[6:0]+31]}}, vbuf_v[32*col_p1[6:0] +: 32]}
-                  <<< 1) - rs80(t_acc, 7'd22);
-        // ---- pass2: rank-1 update, o accumulation ----
-        t2_acc = (wb == 6'd0) ? 80'sd0 : {{8{acc_o[71]}}, acc_o};
-        for (l = 0; l < 4; l = l + 1) begin
-            t2_bk  = bbuf_v[44*{wb[2:0], l[1:0]} +: 44];
-            // u fits 37 bits (|u| <= 2^36 + 2^31: v<<1 vs rs(kS,22))
-            t2_upd = rs80(t2_bk * $signed(t2_u[36:0]), 7'd28);
-            t2_sd  = col[0] ? sdbuf_o_v[34*{wb[2:0], l[1:0]} +: 34]
-                            : sdbuf_v  [34*{wb[2:0], l[1:0]} +: 34];
-            // $signed on the concat: bare concatenations are unsigned and
-            // would force the add unsigned, zero-extending t2_upd (narrower
-            // than the 73-bit context) instead of sign-extending it
-            t2_new = $signed({{39{t2_sd[33]}}, t2_sd}) + t2_upd;
-            t_sat = sat32(t2_new);
-            t2_pn4 = rs80({{48{t_sat[31]}}, t_sat}, 7'd4);
-            p2_word[32*l +: 32] = t_sat;
-            t2_prod = $signed(qbuf_v[32*{wb[2:0], l[1:0]} +: 32]) * t2_pn4;
-            t2_acc = t2_acc + {{14{t2_prod[65]}}, t2_prod};
+
+        for (p1_l = 0; p1_l < 8; p1_l = p1_l + 1) begin
+            t_prod = $signed(p1_k_r2[32*p1_l +: 32])
+                   * $signed({{4{p1_sd4_r2[30*p1_l+29]}},
+                              p1_sd4_r2[30*p1_l +: 30]});
+            p1_prod_v[66*p1_l +: 66] = t_prod;
         end
-        p2_acc_n = t2_acc;
-        t_o1 = rs80(t2_acc, 7'd23);
-        t_o2 = rs80(t_o1 * $signed({1'b0, j_cdh}), 7'd16);
-        p2_o = sat32({{21{t_o2[58]}}, t_o2});
+
+        p1_acc_base = p1_tag6[8] ? 80'sd0 : {{8{acc_kS[71]}}, acc_kS};
+        p1_pair01 = {{14{p1_prod_r3[65]}}, p1_prod_r3[65:0]}
+                  + {{14{p1_prod_r3[131]}}, p1_prod_r3[131:66]};
+        p1_pair23 = {{14{p1_prod_r3[197]}}, p1_prod_r3[197:132]}
+                  + {{14{p1_prod_r3[263]}}, p1_prod_r3[263:198]};
+        p1_pair45 = {{14{p1_prod_r3[329]}}, p1_prod_r3[329:264]}
+                  + {{14{p1_prod_r3[395]}}, p1_prod_r3[395:330]};
+        p1_pair67 = {{14{p1_prod_r3[461]}}, p1_prod_r3[461:396]}
+                  + {{14{p1_prod_r3[527]}}, p1_prod_r3[527:462]};
+        // Keep the eight-row reduction balanced. The previous left-associated
+        // chain put four wide adders after the pair sums on the KDA critical path.
+        p1_sum0123 = p1_pair01_r4 + p1_pair23_r4;
+        p1_sum4567 = p1_pair45_r4 + p1_pair67_r4;
+        p1_sumall  = p1_sumall_r6;
+        p1_acc_n   = p1_acc_base + p1_sumall;
+        p1_u_n = ({{48{p1_v_r6[31]}}, p1_v_r6} <<< 1)
+               - rs80(p1_acc_r4, 7'd22);
+    end
+
+    always @* begin
+        for (p2_l = 0; p2_l < 8; p2_l = p2_l + 1)
+            p2_update_next[72*p2_l +: 72] =
+                rs80($signed(p2_bk_r0[44*p2_l +: 44])
+                   * $signed(p2_u_r0[36:0]), 7'd28);
+
+        for (p2_l = 0; p2_l < 8; p2_l = p2_l + 1) begin
+            p2_new = $signed({{39{p2_sd_r1[34*p2_l+33]}},
+                               p2_sd_r1[34*p2_l +: 34]})
+                   + $signed(p2_update_r1[72*p2_l +: 72]);
+            p2_sat = sat32(p2_new);
+            p2_state_next[32*p2_l +: 32] = p2_sat;
+            p2_pn4_next[32*p2_l +: 32] =
+                rs80({{48{p2_sat[31]}}, p2_sat}, 7'd4);
+        end
+
+        for (p2_l = 0; p2_l < 8; p2_l = p2_l + 1) begin
+            p2_prod = $signed(p2_q_r2[32*p2_l +: 32])
+                    * $signed(p2_pn4_r2[32*p2_l +: 32]);
+            p2_qprod_next[66*p2_l +: 66] = p2_prod;
+        end
+
+        p2_acc_base = p2_tag3[27] ? 80'sd0 : {{8{acc_o[71]}}, acc_o};
+        p2_pair01 = {{14{p2_qprod_r3[65]}}, p2_qprod_r3[65:0]}
+                  + {{14{p2_qprod_r3[131]}}, p2_qprod_r3[131:66]};
+        p2_pair23 = {{14{p2_qprod_r3[197]}}, p2_qprod_r3[197:132]}
+                  + {{14{p2_qprod_r3[263]}}, p2_qprod_r3[263:198]};
+        p2_pair45 = {{14{p2_qprod_r3[329]}}, p2_qprod_r3[329:264]}
+                  + {{14{p2_qprod_r3[395]}}, p2_qprod_r3[395:330]};
+        p2_pair67 = {{14{p2_qprod_r3[461]}}, p2_qprod_r3[461:396]}
+                  + {{14{p2_qprod_r3[527]}}, p2_qprod_r3[527:462]};
+        p2_acc_n = p2_acc_base + p2_pair01 + p2_pair23
+                  + p2_pair45 + p2_pair67;
+
+        p2_o1_next = rs80(p2_acc_r4, 7'd23);
+        p2_o2_next = rs80(p2_o1_r5 * $signed({1'b0, j_cdh}), 7'd16);
+        p2_out_next = sat32({{21{p2_o2_r6[58]}}, p2_o2_r6});
     end
     /* verilator lint_on WIDTHEXPAND */
     /* verilator lint_on WIDTHTRUNC */
 
-    // pass2's u for the current column (odd/even ping-pong with pass1)
-    wire signed [55:0] t2_u = col[0] ? u_o_r : u_r;
-
     // o write port (single lane, last sub-beat of the column)
     wire [8:0] o_word = ld_base + {4'b0, col[6:2]};
-    assign xw_we    = p2_fire && ({1'b0, wb} == s_nsb - 7'd1);
-    assign xw_addr  = {j_obuf, o_word};
-    assign xw_data  = {p2_o, p2_o, p2_o, p2_o};
-    assign xw_wstrb = 4'b0001 << col[1:0];
+    wire [27:0] p2_tag_input = {
+        (wb == 2'd0), ({5'b0, wb} == s_nsb - 7'd1),
+        {j_obuf, o_word}, (4'b0001 << col[1:0]), wb[0], s_widx[7:0]
+    };
+    assign xw_we    = p2_valid7 && p2_tag7[26];
+    assign xw_addr  = p2_tag7[25:13];
+    assign xw_data  = {4{p2_out_r7}};
+    assign xw_wstrb = p2_tag7[12:9];
 
     // debug read port (registered address; macro data one cycle later)
     assign s_dbg_data = s_rd[32*s_dbg_addr_r[2:0] +: 32];
@@ -308,7 +397,7 @@ module msh_kda (
     wire _unused = &{1'b0, job_z_buf, job_layer, j_layer, job_dh[8],
                      s_widx[12:8], s_ridx[12:8], s_dbg_addr_r[17:11],
                      u_r[55:37], u_o_r[55:37], t2_u[55:37],
-                     p1_acc_n[79:72], p1_u_n[79:56], p2_acc_n[79:72],
+                     p1_acc_n[79:72], p1_u_n[79:56],
                      s_nsb[6:5]};
 
     // ---------------- sequential process ----------------
@@ -332,15 +421,12 @@ module msh_kda (
             hd        <= 4'd0;
             col       <= 9'd0;
             col_p1    <= 9'd0;
-            wb        <= 6'd0;
+            wb_bank_sel <= 4'b0001;
             p1_wb     <= 6'd0;
             p1_rw     <= 6'd0;
             p1_dv     <= 1'b0;
+            p1_pipe_en <= 1'b0;
             beta_r    <= 32'sd0;
-            u_r       <= 56'sd0;
-            u_o_r     <= 56'sd0;
-            acc_kS    <= 72'sd0;
-            acc_o     <= 72'sd0;
             clr       <= 15'd0;
             p0_ph     <= 1'b0;
             p1_ph     <= 1'b0;
@@ -470,30 +556,41 @@ module msh_kda (
                     if (p1_phd && (p1_wd == j_nw - 6'd1)) p1_cap <= 1'b1;
                 end
                 if (p0_cap && p1_cap) begin
-                    wb    <= 6'd0;
+                    wb_bank_sel <= 4'b0001;
                     state <= ST_BK;
                 end
             end
 
-            // -------- bk[i] = rs(beta * kh[i], 24), 4 rows/sub-beat ----
+            // -------- bk[i] = rs(beta * kh[i], 24), 8 rows/word --------
             ST_BK: begin
-                for (i = 0; i < 4; i = i + 1)
-                    bbuf_v[44*{wb[2:0], i[1:0]} +: 44] <=
-                        bk_lane_v[44*i +: 44];
-                if ({1'b0, wb} == s_nsb - 7'd1) begin
-                    wb     <= 6'd0;
+                // Decode the active 8-lane bank explicitly. This keeps the
+                // beta preload off a variable part-select mux.
+                if (wb_bank_sel[0])
+                    for (i = 0; i < 8; i = i + 1)
+                        bbuf_v[44*i +: 44] <= bk_lane_v[44*i +: 44];
+                if (wb_bank_sel[1])
+                    for (i = 0; i < 8; i = i + 1)
+                        bbuf_v[44*(8+i) +: 44] <= bk_lane_v[44*i +: 44];
+                if (wb_bank_sel[2])
+                    for (i = 0; i < 8; i = i + 1)
+                        bbuf_v[44*(16+i) +: 44] <= bk_lane_v[44*i +: 44];
+                if (wb_bank_sel[3])
+                    for (i = 0; i < 8; i = i + 1)
+                        bbuf_v[44*(24+i) +: 44] <= bk_lane_v[44*i +: 44];
+                if ({5'b0, wb} == s_nsb - 7'd1) begin
+                    wb_bank_sel <= 4'b0001;
                     col    <= 9'd0;
                     col_p1 <= 9'd0;
                     p1_wb  <= 6'd0;
                     p1_dv  <= 1'b0;
+                    p1_pipe_en <= 1'b0;
                     state  <= ST_PRIME;
                 end else begin
-                    wb <= wb + 6'd1;
+                    wb_bank_sel <= {wb_bank_sel[2:0], wb_bank_sel[3]};
                 end
             end
 
-            // -------- pipeline fill: pass1 for column 0 --------
-            // (same retimed macro-read pattern as ST_PIPE below)
+            // -------- pass1 issue: one synchronous S read per cycle --------
             ST_PRIME: begin
                 if ({2'b0, p1_wb} < {1'b0, s_nsb}) begin
                     p1_dv <= 1'b1;
@@ -502,83 +599,69 @@ module msh_kda (
                 end else begin
                     p1_dv <= 1'b0;
                 end
-                if (p1_dv) begin
-                    acc_kS <= p1_acc_n[71:0];
-                    for (i = 0; i < 4; i = i + 1)
-                        sdbuf_v[34*{p1_rw[2:0], i[1:0]} +: 34] <=
-                            p1_sd_v[34*i +: 34];
-                    if ({1'b0, p1_rw} == s_nsb - 7'd1) begin
-                        u_r    <= p1_u_n[55:0];
-                        wb     <= 6'd0;
-                        p1_wb  <= 6'd0;
-                        col_p1 <= 9'd1;
-                        state  <= ST_PIPE;
-                    end
+                if (p1_dv && ({1'b0, p1_rw} == s_nsb - 7'd1)) begin
+                    p1_dv <= 1'b0;
+                    p1_wb <= 6'd0;
+                    state <= ST_P1_FLUSH;
                 end
             end
 
-            // -------- steady window: pass1(col_p1) || pass2(col) --------
-            // pass1 fills the column-parity sdbuf/u that pass2 consumes
-            // NEXT window; pass2 reads the one filled LAST window. The S
-            // macro's read and write ports never address the same column.
+            ST_P1_FLUSH: begin
+                if (!(p1_dv || p1_valid0 || p1_valid1 || p1_valid2
+                      || p1_valid3 || p1_valid4 || p1_valid5
+                      || p1_valid6 || p1_valid7)) begin
+                    p1_pipe_en <= (col < j_dh - 9'd1);
+                    col_p1 <= col + 9'd1;
+                    p1_wb <= 6'd0;
+                    p1_dv <= 1'b0;
+                    wb_bank_sel <= 4'b0001;
+                    state <= ST_PIPE;
+                end
+            end
+
             ST_PIPE: begin
-                if ({2'b0, p1_wb} < {1'b0, s_nsb}) begin
+                if (p1_pipe_en && ({2'b0, p1_wb} < {1'b0, s_nsb})) begin
                     p1_dv <= 1'b1;
                     p1_rw <= p1_wb;
                     p1_wb <= p1_wb + 6'd1;
                 end else begin
                     p1_dv <= 1'b0;
                 end
-                if (p1_dv) begin
-                    acc_kS <= p1_acc_n[71:0];
-                    for (i = 0; i < 4; i = i + 1)
-                        if (col_p1[0])
-                            sdbuf_o_v[34*{p1_rw[2:0], i[1:0]} +: 34] <=
-                                p1_sd_v[34*i +: 34];
-                        else
-                            sdbuf_v[34*{p1_rw[2:0], i[1:0]} +: 34] <=
-                                p1_sd_v[34*i +: 34];
-                    if ({1'b0, p1_rw} == s_nsb - 7'd1) begin
-                        if (col_p1[0]) u_o_r <= p1_u_n[55:0];
-                        else           u_r   <= p1_u_n[55:0];
-                    end
-                end
-                // pass2 accumulate (combinational p2_fire gates the S
-                // write and xw_o ports; wb is pass2's sub-beat)
-                if (p1_wb != 6'd0)
-                    acc_o <= p2_acc_n[71:0];
-                // window end: pass1's last consume coincides with
-                // pass2's last sub-beat by construction
-                if (p1_dv && ({1'b0, p1_rw} == s_nsb - 7'd1)) begin
-                    wb    <= 6'd0;
-                    p1_wb <= 6'd0;
-                    if (col == j_dh - 9'd2) begin
-                        col   <= col + 9'd1;
-                        state <= ST_DRAIN;
-                    end else begin
-                        col    <= col + 9'd1;
-                        col_p1 <= col_p1 + 9'd1;
-                    end
-                end else if (p1_wb != 6'd0) begin
-                    wb <= wb + 6'd1;
+                if ({5'b0, wb} == s_nsb - 7'd1) begin
+                    wb_bank_sel <= 4'b0001;
+                    state <= ST_PIPE_DRAIN;
+                end else begin
+                    wb_bank_sel <= {wb_bank_sel[2:0], wb_bank_sel[3]};
                 end
             end
 
-            // -------- pipeline drain: pass2 for the last column --------
-            ST_DRAIN: begin
-                acc_o <= p2_acc_n[71:0];
-                // macro write is combinational (s_we/s_waddr/s_wd/s_wstrb)
-                if ({1'b0, wb} == s_nsb - 7'd1) begin
-                    // xw_* write of o[col] is combinational this cycle
-                    wb <= 6'd0;
-                    if (hd == j_H - 4'd1) begin
-                        state <= ST_DONE;
+            ST_PIPE_DRAIN: begin
+                p1_dv <= 1'b0;
+                if (!(p1_dv || p1_valid0 || p1_valid1 || p1_valid2 ||
+                      p1_valid3 || p1_valid4 || p1_valid5 ||
+                      p1_valid6 || p1_valid7 ||
+                      p2_valid0 || p2_valid1 || p2_valid2 || p2_valid3 ||
+                      p2_valid4 || p2_valid5 || p2_valid6 || p2_valid7)) begin
+                    if (col == j_dh - 9'd1) begin
+                        if (hd == j_H - 4'd1) begin
+                            state <= ST_DONE;
+                        end else begin
+                            hd    <= hd + 4'd1;
+                            col   <= 9'd0;
+                            col_p1 <= 9'd0;
+                            p1_wb <= 6'd0;
+                            p1_dv <= 1'b0;
+                            p1_pipe_en <= 1'b0;
+                            state <= ST_BETA;
+                        end
                     end else begin
-                        hd    <= hd + 4'd1;
-                        state <= ST_BETA;
+                        col    <= col + 9'd1;
+                        col_p1 <= col + 9'd2;
+                        p1_wb  <= 6'd0;
+                        p1_dv  <= 1'b0;
+                        p1_pipe_en <= (col + 9'd2 < j_dh);
+                        state  <= ST_PIPE;
                     end
-                end else begin
-                    wb <= wb + 6'd1;
                 end
             end
 
@@ -591,6 +674,163 @@ module msh_kda (
             default: state <= ST_IDLE;
             endcase
             /* verilator lint_on BLKSEQ */
+        end
+    end
+
+    always @(posedge clk) begin
+        if (!rst_n) begin
+            p1_valid0 <= 1'b0;
+            p1_valid1 <= 1'b0;
+            p1_valid2 <= 1'b0;
+            p1_valid3 <= 1'b0;
+            p1_valid4 <= 1'b0;
+            p1_valid5 <= 1'b0;
+            p1_valid6 <= 1'b0;
+            p1_valid7 <= 1'b0;
+            u_r <= 56'sd0;
+            u_o_r <= 56'sd0;
+            acc_kS <= 72'sd0;
+        end else begin
+            p1_valid0 <= p1_dv;
+            p1_valid1 <= p1_valid0;
+            p1_valid2 <= p1_valid1;
+            p1_valid3 <= p1_valid2;
+            p1_valid4 <= p1_valid3;
+            p1_valid5 <= p1_valid4;
+            p1_valid6 <= p1_valid5;
+            p1_valid7 <= p1_valid6;
+
+            p1_tag1 <= p1_tag0;
+            p1_tag2 <= p1_tag1;
+            p1_tag3 <= p1_tag2;
+            p1_tag4 <= p1_tag3;
+            p1_tag5 <= p1_tag4;
+            p1_tag6 <= p1_tag5;
+            p1_tag7 <= p1_tag6;
+
+            if (p1_dv) begin
+                p1_tag0 <= {p1_rw == 6'd0,
+                            {1'b0, p1_rw} == s_nsb - 7'd1,
+                            col_p1[0], p1_rw};
+                p1_s_r0 <= s_rd;
+                p1_a_r0 <= abuf_v[32*{p1_rw, 3'b000} +: 256];
+                p1_k_r0 <= kbuf_v[32*{p1_rw, 3'b000} +: 256];
+                p1_v_r0 <= vbuf_v[32*col_p1[6:0] +: 32];
+            end
+            if (p1_valid0) begin
+                p1_mul_r1 <= p1_mul_next;
+                p1_k_r1 <= p1_k_r0;
+                p1_v_r1 <= p1_v_r0;
+            end
+            if (p1_valid1) begin
+                p1_sd_r2 <= p1_sd_v;
+                p1_sd4_r2 <= p1_sd4_next;
+                p1_k_r2 <= p1_k_r1;
+                p1_v_r2 <= p1_v_r1;
+            end
+            if (p1_valid2) begin
+                p1_prod_r3 <= p1_prod_v;
+                p1_v_r3 <= p1_v_r2;
+                for (p1_cap_i = 0; p1_cap_i < 8; p1_cap_i = p1_cap_i + 1)
+                    if (p1_tag2[6])
+                        sdbuf_o_v[34*({p1_tag2[5:0], p1_cap_i[2:0]}) +: 34]
+                            <= p1_sd_r2[34*p1_cap_i +: 34];
+                    else
+                        sdbuf_v[34*({p1_tag2[5:0], p1_cap_i[2:0]}) +: 34]
+                            <= p1_sd_r2[34*p1_cap_i +: 34];
+            end
+            if (p1_valid3) begin
+                p1_pair01_r4 <= p1_pair01;
+                p1_pair23_r4 <= p1_pair23;
+                p1_pair45_r4 <= p1_pair45;
+                p1_pair67_r4 <= p1_pair67;
+                p1_v_r4 <= p1_v_r3;
+            end
+            if (p1_valid4) begin
+                p1_sum0123_r5 <= p1_sum0123;
+                p1_sum4567_r5 <= p1_sum4567;
+                p1_v_r5 <= p1_v_r4;
+            end
+            if (p1_valid5) begin
+                p1_sumall_r6 <= p1_sum0123_r5 + p1_sum4567_r5;
+                p1_v_r6 <= p1_v_r5;
+            end
+            if (p1_valid6) begin
+                p1_acc_r4 <= p1_acc_n;
+                acc_kS <= p1_acc_n[71:0];
+            end
+            if (p1_valid7 && p1_tag7[7]) begin
+                if (p1_tag7[6]) u_o_r <= p1_u_n[55:0];
+                else             u_r   <= p1_u_n[55:0];
+            end
+        end
+    end
+
+    always @(posedge clk) begin
+        if (!rst_n) begin
+            p2_valid0 <= 1'b0;
+            p2_valid1 <= 1'b0;
+            p2_valid2 <= 1'b0;
+            p2_valid3 <= 1'b0;
+            p2_valid4 <= 1'b0;
+            p2_valid5 <= 1'b0;
+            p2_valid6 <= 1'b0;
+            p2_valid7 <= 1'b0;
+            acc_o <= 72'sd0;
+        end else begin
+            p2_valid0 <= p2_fire;
+            p2_valid1 <= p2_valid0;
+            p2_valid2 <= p2_valid1;
+            p2_valid3 <= p2_valid2;
+            p2_valid4 <= p2_valid3;
+            p2_valid5 <= p2_valid4;
+            p2_valid6 <= p2_valid5;
+            p2_valid7 <= p2_valid6;
+
+            p2_tag1 <= p2_tag0;
+            p2_tag2 <= p2_tag1;
+            p2_tag3 <= p2_tag2;
+            p2_tag4 <= p2_tag3;
+            p2_tag5 <= p2_tag4;
+            p2_tag6 <= p2_tag5;
+            p2_tag7 <= p2_tag6;
+
+            if (p2_fire) begin
+                p2_tag0 <= p2_tag_input;
+                p2_u_r0 <= t2_u;
+                for (p2_cap_i = 0; p2_cap_i < 8; p2_cap_i = p2_cap_i + 1) begin
+                    p2_bk_r0[44*p2_cap_i +: 44] <=
+                        bbuf_v[44*({wb, p2_cap_i[2:0]}) +: 44];
+                    p2_sd_r0[34*p2_cap_i +: 34] <= col[0]
+                        ? sdbuf_o_v[34*({wb, p2_cap_i[2:0]}) +: 34]
+                        : sdbuf_v[34*({wb, p2_cap_i[2:0]}) +: 34];
+                    p2_q_r0[32*p2_cap_i +: 32] <=
+                        qbuf_v[32*({wb, p2_cap_i[2:0]}) +: 32];
+                end
+            end
+            if (p2_valid0)
+                begin
+                    p2_update_r1 <= p2_update_next;
+                    p2_sd_r1 <= p2_sd_r0;
+                    p2_q_r1 <= p2_q_r0;
+                end
+            if (p2_valid1) begin
+                p2_state_r2 <= p2_state_next;
+                p2_pn4_r2 <= p2_pn4_next;
+                p2_q_r2 <= p2_q_r1;
+            end
+            if (p2_valid2)
+                p2_qprod_r3 <= p2_qprod_next;
+            if (p2_valid3) begin
+                p2_acc_r4 <= p2_acc_n;
+                acc_o <= p2_acc_n[71:0];
+            end
+            if (p2_valid4)
+                p2_o1_r5 <= p2_o1_next;
+            if (p2_valid5)
+                p2_o2_r6 <= p2_o2_next[58:0];
+            if (p2_valid6)
+                p2_out_r7 <= p2_out_next;
         end
     end
 

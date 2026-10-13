@@ -149,7 +149,7 @@ module msh_vec (
                      S_SM_EXP = 5'd11,  // smix: exp LUT
                      S_SM_REC = 5'd12,  // smix: reciprocal
                      S_SM_MAC = 5'd13,  // smix: weighted sum
-                     S_SM_FIN = 5'd14,  // smix: finalize word
+                      S_SM_FIN = 5'd14,  // smix: register word scale input
                      S_TK_MET = 5'd15,  // topk: metric build
                      S_TK_SCN = 5'd16,  // topk: max scan
                      S_TK_MRK = 5'd17,  // topk: mark used / fetch score
@@ -161,8 +161,10 @@ module msh_vec (
                      S_CV_LD  = 5'd23,  // conv: load window words
                      S_CV_RUN = 5'd24,  // conv: MAC + sigmoid pipeline
                      S_CV_FIN = 5'd25,  // conv: word boundary
-                     S_CV_DR  = 5'd26,  // conv: drain
-                     S_DONE   = 5'd27;
+                      S_CV_DR  = 5'd26,  // conv: drain
+                      S_DONE   = 5'd27,
+                       S_SM_OUT = 5'd28,  // smix: final output drain
+                       S_SM_EA_MAX = 5'd29; // smix: register logits maximum
 
     localparam [31:0] ROUTER_Q26 = 32'd189783867;  // round(2.828*2^26)
 
@@ -176,6 +178,7 @@ module msh_vec (
     // ---------------- registered op fields ----------------
     reg  [4:0]  state;
     reg  [4:0]  oc;
+    reg         ew_is_silu, ew_is_add, ew_is_mulz, ew_is_macw;
     reg  [11:0] olen;
     reg  [4:0]  osrc1, osrc2, odst;
     reg  [14:0] owbase;
@@ -218,6 +221,13 @@ module msh_vec (
     reg  [11:0] cnt;
     reg         is_v1, is_v2;
     reg  [11:0] is_i1, is_i2;
+    reg         n2_apply_v1, n2_apply_v2;
+    reg  [11:0] n2_apply_dst1, n2_apply_dst2;
+    reg  [3:0]  n2_apply_mask1, n2_apply_mask2;
+    reg         n2_apply_last1, n2_apply_last2;
+    reg signed [31:0] n2_xs_r;
+    reg signed [43:0] n2_rg_r;
+    reg signed [63:0] n2_yf_r;
     // shared-LUT service counter (free-running): elementwise captures
     // land at serv==3 and lane k of the captured word is served by the
     // shared ROM set at serv==k (one lookup/cycle; area-driven sharing)
@@ -462,7 +472,12 @@ module msh_vec (
     reg [32:0] sc_t;
     reg [19:0] sc_d;
     reg [17:0] sc_frac;
+    reg signed [37:0] sm_exp_dp_r;
     reg signed [8:0] sc_E9;
+    reg [1:0] rsq_pipe_phase;
+    reg signed [25:0] rsq_ip_r;
+    reg signed [33:0] rsq_r0_r;
+    reg signed [63:0] rsq_r1_r;
 
     // rsqrt/recip finalize (mirrors fxluts.rsqrt_eval_i / recip_eval_i)
     wire signed [24:0] sc_dp  = $signed(sc_d)
@@ -483,22 +498,45 @@ module msh_vec (
     wire signed [63:0] r_c    = sh_c[6]
                               ? ((r1_c + $signed(rnd_c)) >>> nsh_c)
                               : (r1_c << sh_c[5:0]);
+    wire signed [63:0] rsq_r0x_pipe = {{30{rsq_r0_r[33]}}, rsq_r0_r};
+    wire signed [63:0] rsq_r1_pipe  = sc_E9[0]
+                              ? (($signed(rsq_r0x_pipe[33:0]) * 20'sd370728
+                                  + 64'sd131072) >>> 18)
+                              : rsq_r0x_pipe;
+    wire signed [63:0] rsq_final_pipe = sh_c[6]
+                              ? ((rsq_r1_r + $signed(rnd_c)) >>> nsh_c)
+                              : (rsq_r1_r << sh_c[5:0]);
     wire signed [6:0]  sh2_c  = 7'sd16 - sc_E9[6:0];      // sy = 46
     wire [5:0]         nsh2_c = 6'd0 - sh2_c[5:0];
     wire [63:0]        rnd2_c = 64'd1 << (nsh2_c - 6'd1);
+    wire signed [15:0] rec_ip_c = sc_ip[15:0];
+    wire signed [21:0] rec_t_c = $signed({2'b0, sc_t[19:0]});
+    wire signed [21:0] rec_ip_ext_c = {{6{rec_ip_c[15]}}, rec_ip_c};
+    wire signed [21:0] rec_r0_c = rec_t_c + rec_ip_ext_c;
+    // The right-shift branch rounds by up to 2^35 and shifts by at most 36.
+    wire signed [56:0] rec_r0_ext_c = {{35{rec_r0_c[21]}}, rec_r0_c};
+    wire signed [56:0] rec_round_c = rec_r0_ext_c
+                                      + $signed({21'b0, rnd2_c[35:0]});
+    wire signed [56:0] rec_right_c = rec_round_c >>> nsh2_c;
+    wire signed [20:0] rec_left_c = $signed(rec_r0_c[20:0])
+                                     <<< sh2_c[5:0];
+    wire signed [20:0] rec_narrow_c = sh2_c[6]
+                                      ? rec_right_c[20:0]
+                                      : rec_left_c;
     wire signed [63:0] rec_c  = sh2_c[6]
                               ? ((r0x_c + $signed(rnd2_c)) >>> nsh2_c)
                               : (r0x_c << sh2_c[5:0]);
 
     // exp finalize for smix (sh = 18 path)
-    wire signed [37:0] exp_dp = $signed(sc_d)
-                              * $signed({1'b0, sc_frac[17:0]});
     wire signed [37:0] exp_y  = $signed({11'b0, sc_t[26:0]})
-                              + ((exp_dp + 38'sd131072) >>> 18);
+                              + ((sm_exp_dp_r + 38'sd131072) >>> 18);
     wire [26:0]        e_c    = exp_y[26:0];
 
     // exp index from ea_r (clip to [-2^30, 0] already applied)
+    reg  signed [63:0] mx_r;
     reg  signed [31:0] ea_r;
+    wire signed [37:0] sm_exp_dp_next = $signed(scm_sexp_d[19:0])
+                                       * $signed({1'b0, ea_r[17:0]});
     wire signed [31:0] eb_c   = ea_r >>> 18;
     wire signed [31:0] ei0_c  = eb_c + 32'sd4096;
     wire [12:0]        eidx_c = (ei0_c < 32'sd0)      ? 13'd0
@@ -509,6 +547,12 @@ module msh_vec (
     // Norm datapath
     // ============================================================
     reg  [79:0] ss_acc;
+    reg         ssq_v1, ssq_v2, ssq_v3;
+    reg  [11:0] ssq_idx1, ssq_idx2, ssq_idx3;
+    reg         ssq_last1, ssq_last2, ssq_last3;
+    reg  [63:0] ssq_p0_r, ssq_p1_r, ssq_p2_r, ssq_p3_r;
+    reg  [65:0] ssq_pair01_r, ssq_pair23_r;
+    reg  [66:0] ssq_total_r;
     reg  signed [63:0] rsq_r;
 
     // inv_d24 divider: q = (2^24 + d/2) div d, 25 iterations
@@ -544,16 +588,18 @@ module msh_vec (
     wire signed [63:0] sq_p1 = sq_l1 * sq_l1;
     wire signed [63:0] sq_p2 = sq_l2 * sq_l2;
     wire signed [63:0] sq_p3 = sq_l3 * sq_l3;
-    wire [65:0] sq_a01 = {2'b0, (sq_v0 ? sq_p0 : 64'sd0)}
-                       + {2'b0, (sq_v1 ? sq_p1 : 64'sd0)};
-    wire [65:0] sq_a23 = {2'b0, (sq_v2 ? sq_p2 : 64'sd0)}
-                       + {2'b0, (sq_v3 ? sq_p3 : 64'sd0)};
-    wire [66:0] sq_all = {1'b0, sq_a01} + {1'b0, sq_a23};
+    wire [65:0] ssq_pair01_next = {2'b0, ssq_p0_r} + {2'b0, ssq_p1_r};
+    wire [65:0] ssq_pair23_next = {2'b0, ssq_p2_r} + {2'b0, ssq_p3_r};
+    wire [66:0] ssq_total_next = {1'b0, ssq_pair01_r}
+                               + {1'b0, ssq_pair23_r};
 
-    // variance: rmsnorm v = (ss*inv_d24 + 2^43) >> 44; l2norm v = (ss+2^19)>>20
-    wire [103:0] var_prod = {24'b0, ss_acc} * {80'b0, invd24_r};
-    wire [104:0] var_pr   = {1'b0, var_prod} + 105'd8796093022208;
-    wire [60:0]  var_rms  = var_pr[104:44];
+    // RMSNorm has at most 4095 signed-32 samples: sum(x*x) < 2^74.
+    // Keep only that reachable accumulator range in the 74x24 product.
+    // The full-width L2 path remains unchanged.
+    wire [97:0] var_prod = ss_acc[73:0] * invd24_r;
+    wire [98:0] var_pr   = {1'b0, var_prod} + 99'd8796093022208;
+    // (2^74-1)*(2^24-1) + 2^43 < 2^98, so bit 98 is always zero.
+    wire [60:0]  var_rms  = {7'b0, var_pr[97:44]};
     wire [80:0]  var_l2s  = {1'b0, ss_acc} + 81'd524288;
     wire [60:0]  var_l2   = var_l2s[80:20];
     wire [60:0]  var_c    = (oc == OP_L2NORM) ? var_l2 : var_rms;
@@ -576,15 +622,19 @@ module msh_vec (
                                   * $signed(n2_g64[16:0])
                                   + 64'sd4096) >>> 13;
     wire signed [63:0] n2_xs  = (n2_x + 64'sd8) >>> 4;
-    wire signed [63:0] n2_yf  = ($signed(n2_xs[31:0])
-                                  * $signed(n2_rg[43:0])
-                                  + 64'sd524288) >>> 20;
-    wire [31:0]        n2_y   = sat32f(n2_yf);
+    // Registered apply stages separate the WBUF gain multiply from the
+    // input multiply and final saturation while preserving one issue/cycle.
+    wire signed [75:0] n2_apply_prod = $signed(n2_xs_r) * $signed(n2_rg_r);
+    wire signed [75:0] n2_apply_round = n2_apply_prod + 76'sd524288;
+    wire signed [63:0] n2_apply_yf = n2_apply_round >>> 20;
+    wire [31:0] n2_apply_y = sat32f(n2_yf_r);
 
     // dot: acc += x*w (same issue pipeline / lane select as norms)
     wire signed [63:0] dt_prod = $signed(n2_x[31:0]) * $signed(w_data);
     reg  signed [63:0] acc_r;
-    wire signed [63:0] dt_acc  = acc_r + dt_prod;
+    reg  signed [63:0] dot_prod_r;
+    reg                dot_prod_valid_r, dot_prod_last_r;
+    wire signed [63:0] dt_acc  = acc_r + dot_prod_r;
 
     // topk metric: score + (bias << 15), 33-bit signed
     wire signed [32:0] tk_sc  = {n2_x32[31], n2_x32};
@@ -599,6 +649,14 @@ module msh_vec (
     reg  [20:0]        rec_r;
     reg  [255:0] acc_l_v;
     reg  [2:0]         cand_i;
+    reg signed [63:0] sm_mac_p0_r, sm_mac_p1_r;
+    reg signed [63:0] sm_mac_p2_r, sm_mac_p3_r;
+    reg                sm_mac_valid_r, sm_mac_last_r;
+    reg signed [60:0]  sm_fin_prod0_r, sm_fin_prod1_r;
+    reg signed [60:0]  sm_fin_prod2_r, sm_fin_prod3_r;
+    reg                sm_fin_valid_r;
+    reg  [11:0]        sm_fin_cnt_r;
+    reg  [3:0]         sm_fin_mask_r;
 
     wire signed [63:0] mx01  = ($signed(log_r_v[64*(0) +: 64]) > $signed(log_r_v[64*(1) +: 64])) ? $signed(log_r_v[64*(0) +: 64]) : $signed(log_r_v[64*(1) +: 64]);
     wire signed [63:0] mx23  = ($signed(log_r_v[64*(2) +: 64]) > $signed(log_r_v[64*(3) +: 64])) ? $signed(log_r_v[64*(2) +: 64]) : $signed(log_r_v[64*(3) +: 64]);
@@ -607,7 +665,7 @@ module msh_vec (
                              : (ncand_r == 4'd4)
                              ? ((mx01 > mx23) ? mx01 : mx23)
                              : mx01;
-    wire signed [63:0] ea_d   = $signed(log_r_v[64*(cand_i[1:0]) +: 64]) - mx_c;
+    wire signed [63:0] ea_d   = $signed(log_r_v[64*(cand_i[1:0]) +: 64]) - mx_r;
     wire signed [63:0] ea_s   = (ea_d + 64'sd1024) >>> 11;
     wire signed [31:0] ea_clip = (ea_s < -64'sd1073741824)
                                ? -32'sd1073741824
@@ -618,36 +676,49 @@ module msh_vec (
                       : (cand_i == 3'd1) ? oaux[13:9]
                       : (cand_i == 3'd2) ? oaux[18:14] : oaux[23:19];
 
-    wire signed [63:0] mac_e   = {37'b0, e_r_v[27*(is_i2[1:0]) +: 27]};
-    wire signed [63:0] mac_l0  = {{32{xa_data[31]}},  xa_data[31:0]};
-    wire signed [63:0] mac_l1  = {{32{xa_data[63]}},  xa_data[63:32]};
-    wire signed [63:0] mac_l2  = {{32{xa_data[95]}},  xa_data[95:64]};
-    wire signed [63:0] mac_l3  = {{32{xa_data[127]}}, xa_data[127:96]};
-    wire signed [63:0] mac_p0  = $signed(mac_l0[31:0])
-                                 * $signed({1'b0, mac_e[26:0]});
-    wire signed [63:0] mac_p1  = $signed(mac_l1[31:0])
-                                 * $signed({1'b0, mac_e[26:0]});
-    wire signed [63:0] mac_p2  = $signed(mac_l2[31:0])
-                                 * $signed({1'b0, mac_e[26:0]});
-    wire signed [63:0] mac_p3  = $signed(mac_l3[31:0])
-                                 * $signed({1'b0, mac_e[26:0]});
+    wire signed [27:0] mac_e = {1'b0, e_r_v[27*(is_i2[1:0]) +: 27]};
+    wire signed [31:0] mac_l0 = xa_data[31:0];
+    wire signed [31:0] mac_l1 = xa_data[63:32];
+    wire signed [31:0] mac_l2 = xa_data[95:64];
+    wire signed [31:0] mac_l3 = xa_data[127:96];
+    wire signed [58:0] mac_p0 = $signed(mac_l0) * $signed(mac_e);
+    wire signed [58:0] mac_p1 = $signed(mac_l1) * $signed(mac_e);
+    wire signed [58:0] mac_p2 = $signed(mac_l2) * $signed(mac_e);
+    wire signed [58:0] mac_p3 = $signed(mac_l3) * $signed(mac_e);
 
-    wire signed [63:0] fin_ys0 = ($signed(acc_l_v[64*(0) +: 64]) + 64'sd8388608) >>> 24;
-    wire signed [63:0] fin_ys1 = ($signed(acc_l_v[64*(1) +: 64]) + 64'sd8388608) >>> 24;
-    wire signed [63:0] fin_ys2 = ($signed(acc_l_v[64*(2) +: 64]) + 64'sd8388608) >>> 24;
-    wire signed [63:0] fin_ys3 = ($signed(acc_l_v[64*(3) +: 64]) + 64'sd8388608) >>> 24;
-    wire [31:0] fin_y0 = sat32f(($signed(fin_ys0[39:0])
-                                   * $signed({1'b0, rec_r})
-                                   + 64'sd2097152) >>> 22);
-    wire [31:0] fin_y1 = sat32f(($signed(fin_ys1[39:0])
-                                   * $signed({1'b0, rec_r})
-                                   + 64'sd2097152) >>> 22);
-    wire [31:0] fin_y2 = sat32f(($signed(fin_ys2[39:0])
-                                   * $signed({1'b0, rec_r})
-                                   + 64'sd2097152) >>> 22);
-    wire [31:0] fin_y3 = sat32f(($signed(fin_ys3[39:0])
-                                   * $signed({1'b0, rec_r})
-                                   + 64'sd2097152) >>> 22);
+    // Round at bit 23, then shift 24: the upper 40 bits add the carry from bit 23.
+    wire signed [39:0] fin_ys_n0 = $signed(acc_l_v[24 +: 40])
+                                   + $signed({39'd0, acc_l_v[23]});
+    wire signed [39:0] fin_ys_n1 = $signed(acc_l_v[88 +: 40])
+                                   + $signed({39'd0, acc_l_v[87]});
+    wire signed [39:0] fin_ys_n2 = $signed(acc_l_v[152 +: 40])
+                                   + $signed({39'd0, acc_l_v[151]});
+    wire signed [39:0] fin_ys_n3 = $signed(acc_l_v[216 +: 40])
+                                   + $signed({39'd0, acc_l_v[215]});
+    wire signed [63:0] fin_ys0 = {{24{fin_ys_n0[39]}}, fin_ys_n0};
+    wire signed [63:0] fin_ys1 = {{24{fin_ys_n1[39]}}, fin_ys_n1};
+    wire signed [63:0] fin_ys2 = {{24{fin_ys_n2[39]}}, fin_ys_n2};
+    wire signed [63:0] fin_ys3 = {{24{fin_ys_n3[39]}}, fin_ys_n3};
+
+    // A signed 40-bit value times positive 21-bit rec_r, including rounding, fits 61 bits.
+    // Register the multiplier outputs so the next cycle only carries the
+    // fixed-point rounding and saturation network into xw_data.
+    wire signed [60:0] fin_prod0 = sm_fin_prod0_r;
+    wire signed [60:0] fin_prod1 = sm_fin_prod1_r;
+    wire signed [60:0] fin_prod2 = sm_fin_prod2_r;
+    wire signed [60:0] fin_prod3 = sm_fin_prod3_r;
+    wire signed [60:0] fin_scaled0 = (fin_prod0 + 61'sd2097152) >>> 22;
+    wire signed [60:0] fin_scaled1 = (fin_prod1 + 61'sd2097152) >>> 22;
+    wire signed [60:0] fin_scaled2 = (fin_prod2 + 61'sd2097152) >>> 22;
+    wire signed [60:0] fin_scaled3 = (fin_prod3 + 61'sd2097152) >>> 22;
+    wire signed [63:0] fin_scaled0_ext = {{3{fin_scaled0[60]}}, fin_scaled0};
+    wire signed [63:0] fin_scaled1_ext = {{3{fin_scaled1[60]}}, fin_scaled1};
+    wire signed [63:0] fin_scaled2_ext = {{3{fin_scaled2[60]}}, fin_scaled2};
+    wire signed [63:0] fin_scaled3_ext = {{3{fin_scaled3[60]}}, fin_scaled3};
+    wire [31:0] fin_y0 = sat32f(fin_scaled0_ext);
+    wire [31:0] fin_y1 = sat32f(fin_scaled1_ext);
+    wire [31:0] fin_y2 = sat32f(fin_scaled2_ext);
+    wire [31:0] fin_y3 = sat32f(fin_scaled3_ext);
 
     // ============================================================
     // Top-k datapath
@@ -708,11 +779,16 @@ module msh_vec (
     // ============================================================
     reg  [127:0] ew_x1, ew_x2, ew_x3, ew_x4, ew_x5, ew_x6;
     reg  [127:0] ew_b1, ew_b2, ew_b3, ew_b4, ew_b5, ew_b6;
-    reg          ew_v2, ew_v3, ew_v4, ew_v5, ew_v6, ew_v7;
-    reg  [11:0]  ew_w3, ew_w4, ew_w5, ew_w6, ew_w7, ew_w8;
+    reg  [255:0] ew_mul_p_r;
+    reg  [127:0] ew_base_r, ew_lut_r;
+    reg          ew_v2, ew_v3, ew_v4, ew_v5, ew_v6, ew_v7, ew_v8;
+    reg  [11:0]  ew_w3, ew_w4, ew_w5, ew_w6, ew_w7, ew_w8, ew_w9;
     reg  [31:0]  mw_wsel;
     wire [127:0] ew_y_flat;
-
+    wire [255:0] ew_mul_p_flat;
+    wire [127:0] ew_base_flat;
+    wire         ew_pipe_mode = ew_is_silu || ew_is_add
+                              || ew_is_mulz || ew_is_macw;
     genvar gf;
     generate
     for (gf = 0; gf < 4; gf = gf + 1) begin : ewf
@@ -720,15 +796,23 @@ module msh_vec (
         wire signed [63:0] b  = {{32{ew_b6[32*gf+31]}}, ew_b6[32*gf +: 32]};
         wire signed [63:0] sg = {37'b0, ll_y_flat[32*gf +: 27]};
         wire signed [63:0] ws = {{32{mw_wsel[31]}}, mw_wsel};
-        wire signed [63:0] ps = a * sg;
-        wire signed [63:0] pm = a * b;
-        wire signed [63:0] pw = b * ws;
+        wire signed [63:0] p_r = $signed(ew_mul_p_r[64*gf +: 64]);
+        wire signed [63:0] base_r = {{32{ew_base_r[32*gf+31]}},
+                                      ew_base_r[32*gf +: 32]};
+        wire signed [63:0] add_sum = a + b;
+        wire signed [63:0] qmul_r = (p_r + 64'sd33554432) >>> 26;
+        wire signed [63:0] ew_mul_a = ew_is_macw ? b : a;
+        wire signed [63:0] ew_mul_b = ew_is_silu ? sg
+                                     : ew_is_macw ? ws : b;
+        wire signed [63:0] ew_mul_p = ew_is_add ? 64'sd0 : ew_mul_a * ew_mul_b;
+        assign ew_mul_p_flat[64*gf +: 64] = ew_mul_p;
+        assign ew_base_flat[32*gf +: 32] = ew_is_add ? sat32f(add_sum) : a[31:0];
         assign ew_y_flat[32*gf +: 32] =
-            (oc == OP_SILU) ? sat32f((ps + 64'sd33554432) >>> 26)
-          : (oc == OP_ADD)  ? sat32f(a + b)
-          : (oc == OP_MULZ) ? sat32f((pm + 64'sd33554432) >>> 26)
-          : (oc == OP_MACW) ? sat32f(a + ((pw + 64'sd33554432) >>> 26))
-          :                   ll_y_flat[32*gf +: 32];
+            ew_is_silu ? sat32f(qmul_r)
+          : ew_is_add  ? ew_base_r[32*gf +: 32]
+          : ew_is_mulz ? sat32f(qmul_r)
+          : ew_is_macw ? sat32f(base_r + qmul_r)
+          :              ew_lut_r[32*gf +: 32];
     end
     endgenerate
 
@@ -736,24 +820,26 @@ module msh_vec (
     // Prealpha datapath (element-serial, 2 WBUF reads per element)
     // ============================================================
     reg         pa_t;                 // 0: dtb+x issue, 1: A issue
-    reg         pa_d1, pa_d2, pa_d3;  // pipeline valids
-    reg  [11:0] pa_i1, pa_i2, pa_i3;
+    reg         pa_d1, pa_d2, pa_d3, pa_d4;  // pipeline valids
+    reg  [11:0] pa_i1, pa_i2, pa_i3, pa_i4;
     reg  [7:0]  pa_h;                 // running head index i/dh
     reg  [11:0] pa_hc;                // running count within head
     reg  [15:0] dtb_r;
     reg  [127:0] fx_r;
+    reg signed [63:0] pa_prod_r;
 
-    wire [1:0]  pa_lane = pa_i3[1:0];
-    wire [31:0] pa_f32  = (pa_lane == 2'd0) ? fx_r[31:0]
-                        : (pa_lane == 2'd1) ? fx_r[63:32]
-                        : (pa_lane == 2'd2) ? fx_r[95:64]
+    wire [1:0]  pa_lane3 = pa_i3[1:0];
+    wire [1:0]  pa_lane4 = pa_i4[1:0];
+    wire [31:0] pa_f32  = (pa_lane3 == 2'd0) ? fx_r[31:0]
+                        : (pa_lane3 == 2'd1) ? fx_r[63:32]
+                        : (pa_lane3 == 2'd2) ? fx_r[95:64]
                         :                     fx_r[127:96];
     wire signed [33:0] pa_fx  = {{2{pa_f32[31]}}, pa_f32};
     wire signed [33:0] pa_dt  = {{18{dtb_r[15]}}, dtb_r} <<< 15;
     wire signed [33:0] pa_sum = pa_fx + pa_dt;
     wire signed [63:0] pa_prod = $signed({{1'b0, w_data}})
-                                 * $signed(pa_sum);
-    wire [31:0]        pa_arg  = sat32f((pa_prod + 64'sd128) >>> 8);
+                                  * $signed(pa_sum);
+    wire [31:0]        pa_arg  = sat32f((pa_prod_r + 64'sd128) >>> 8);
 
     // ============================================================
     // Conv datapath
@@ -764,6 +850,17 @@ module msh_vec (
     reg          cv_wait;
     reg  [1:0]   cv_l, cv_t;
     reg  signed [63:0] cv_y, cv_yq;
+    reg  signed [63:0] cv_prod_r, cv_prod2_r, cv_pair_sum_r;
+    reg  signed [31:0] cv_mac_x_r, cv_mac_x2_r;
+    reg  signed [15:0] cv_mac_w_r, cv_mac_w2_r;
+    reg                 cv_mac_valid;
+    reg  [1:0]          cv_mac_ml_r, cv_mac_mt_r;
+    reg  [8:0]          cv_mac_wi_r;
+    reg                 cv_mac_last_r;
+    reg          cv_prod_valid, cv_pair_valid;
+    reg  [1:0]   cv_prod_ml_r, cv_prod_mt_r, cv_pair_ml_r, cv_pair_mt_r;
+    reg  [8:0]   cv_prod_wi_r, cv_pair_wi_r;
+    reg          cv_prod_last_r, cv_pair_last_r;
     // element-sum delay line matching the cv_sv[2] output stage (the
     // push cadence is 2 cycles with 2-tap pairs, faster than the
     // cv_yq->output delay, so the sum must travel with the request)
@@ -772,6 +869,13 @@ module msh_vec (
     reg  [1:0]   cv_si0, cv_si1, cv_si2;
     reg  [8:0]   cv_wi0, cv_wi1, cv_wi2;
     reg          cv_last0, cv_last1, cv_last2;
+    reg signed [33:0] cv_y1_r;
+    reg        [26:0] cv_ll_y_r;
+    reg signed [61:0] cv_scale_prod_r;
+    reg          cv_scale_v0, cv_scale_v1;
+    reg  [1:0]   cv_scale_si0, cv_scale_si1;
+    reg  [8:0]   cv_scale_wi0, cv_scale_wi1;
+    reg          cv_scale_last0, cv_scale_last1;
 
     wire        cv_active = (state == S_CV_LD)  || (state == S_CV_RUN)
                          || (state == S_CV_FIN) || (state == S_CV_DR);
@@ -793,24 +897,40 @@ module msh_vec (
                            : (cap_ml == 2'd1) ? win_word2[63:32]
                            : (cap_ml == 2'd2) ? win_word2[95:64]
                            :                    win_word2[127:96];
-    wire signed [63:0] cv_prod  = $signed(win_lane[31:0])
-                                * $signed(w_data);
-    wire signed [63:0] cv_prod2 = $signed(win2_x32)
-                                * $signed(w2_data);
+    wire signed [31:0] cv_in_x   = $signed(win_lane[31:0]);
+    wire signed [15:0] cv_in_w   = $signed(w_data);
+    wire signed [31:0] cv_in_x2  = $signed(win2_x32);
+    wire signed [15:0] cv_in_w2  = $signed(w2_data);
+    // Register the decoded operands before the 32x16 products. This keeps the
+    // issue cadence at one pair per cycle while separating tap/lane muxing from
+    // the multiplier capture path.
+    wire signed [63:0] cv_prod  = $signed(cv_mac_x_r)
+                                 * $signed(cv_mac_w_r);
+    wire signed [63:0] cv_prod2 = $signed(cv_mac_x2_r)
+                                 * $signed(cv_mac_w2_r);
     // 2-tap pairs (cap_mt in {0,2}): both taps of the pair accumulate
     // in the same cycle; the pair starting at tap 0 sets the sum
-    wire signed [63:0] cv_yfin  = (cap_mt == 2'd0)
-                                ? (cv_prod + cv_prod2)
-                                : (cv_y + cv_prod + cv_prod2);
-    wire signed [63:0] cv_y1    = (cv_yq2 + 64'sd32768) >>> 16;
-    wire [31:0]        cv_out   = sat32f(($signed(cv_y1[47:0])
-                                            * $signed({{1'b0, ll_y_flat[26:0]}})
-                                          + 64'sd1048576) >>> 21);
+    wire signed [63:0] cv_pair_sum = cv_prod_r + cv_prod2_r;
+    wire signed [63:0] cv_yfin  = (cv_pair_mt_r == 2'd0)
+                                ? cv_pair_sum_r
+                                : (cv_y + cv_pair_sum_r);
+    // The four signed 32x16 taps fit a signed 50-bit sum. Round by adding
+    // the carry from the discarded half bit instead of a wide constant adder.
+    wire signed [33:0] cv_y1 = $signed(cv_yq2[49:16])
+                              + $signed({33'd0, cv_yq2[15]});
+    wire signed [61:0] cv_scale_prod = $signed(cv_y1_r)
+                                      * $signed({1'b0, cv_ll_y_r});
+    // Adding 2^20 before >>>21 is exactly a carry from product bit20.
+    wire signed [40:0] cv_scaled = $signed(cv_scale_prod_r[61:21])
+                                  + $signed({40'd0, cv_scale_prod_r[20]});
+    wire [31:0] cv_out = (cv_scaled[40:32] == {9{cv_scaled[31]}})
+                       ? cv_scaled[31:0]
+                       : (cv_scaled[40] ? 32'h80000000 : 32'h7fffffff);
     wire [15:0]        cv_wa16  = {1'b0, owbase} + {2'b0, cnt[9:0], 4'b0000}
                                                 + {12'b0, cv_l, 2'b00}
                                                 + {14'b0, cv_t};
     wire [14:0]        cv_wa    = cv_wa16[14:0];
-    wire        cv_push = cv_active && is_v2 && (cap_mt == 2'd2);
+    wire        cv_push = cv_pair_valid && (cv_pair_mt_r == 2'd2);
 
     // ============================================================
     // Main FSM
@@ -822,6 +942,10 @@ module msh_vec (
         if (!rst_n) begin
             state      <= S_CLR;
             oc         <= 5'd0;
+            ew_is_silu <= 1'b0;
+            ew_is_add  <= 1'b0;
+            ew_is_mulz <= 1'b0;
+            ew_is_macw <= 1'b0;
             olen       <= 12'd0;
             osrc1      <= 5'd0;
             osrc2      <= 5'd0;
@@ -843,6 +967,46 @@ module msh_vec (
             is_v2      <= 1'b0;
             is_i1      <= 12'd0;
             is_i2      <= 12'd0;
+            sm_mac_p0_r <= 64'sd0;
+            sm_mac_p1_r <= 64'sd0;
+            sm_mac_p2_r <= 64'sd0;
+            sm_mac_p3_r <= 64'sd0;
+            sm_mac_valid_r <= 1'b0;
+            sm_mac_last_r <= 1'b0;
+            sm_fin_prod0_r <= 61'sd0;
+            sm_fin_prod1_r <= 61'sd0;
+            sm_fin_prod2_r <= 61'sd0;
+            sm_fin_prod3_r <= 61'sd0;
+            sm_fin_valid_r <= 1'b0;
+            sm_fin_cnt_r <= 12'd0;
+            sm_fin_mask_r <= 4'd0;
+            ssq_v1     <= 1'b0;
+            ssq_v2     <= 1'b0;
+            ssq_v3     <= 1'b0;
+            ssq_idx1   <= 12'd0;
+            ssq_idx2   <= 12'd0;
+            ssq_idx3   <= 12'd0;
+            ssq_last1  <= 1'b0;
+            ssq_last2  <= 1'b0;
+            ssq_last3  <= 1'b0;
+            ssq_p0_r   <= 64'd0;
+            ssq_p1_r   <= 64'd0;
+            ssq_p2_r   <= 64'd0;
+            ssq_p3_r   <= 64'd0;
+            ssq_pair01_r <= 66'd0;
+            ssq_pair23_r <= 66'd0;
+            ssq_total_r  <= 67'd0;
+            n2_apply_v1 <= 1'b0;
+            n2_apply_v2 <= 1'b0;
+            n2_apply_dst1 <= 12'd0;
+            n2_apply_dst2 <= 12'd0;
+            n2_apply_mask1 <= 4'd0;
+            n2_apply_mask2 <= 4'd0;
+            n2_apply_last1 <= 1'b0;
+            n2_apply_last2 <= 1'b0;
+            n2_xs_r <= 32'sd0;
+            n2_rg_r <= 44'sd0;
+            n2_yf_r <= 64'sd0;
             xa_addr    <= 14'd0;
             xb_addr    <= 14'd0;
             xw_we      <= 1'b0;
@@ -865,8 +1029,17 @@ module msh_vec (
             sc_t       <= 33'd0;
             sc_d       <= 20'd0;
             sc_frac    <= 18'd0;
+            sm_exp_dp_r <= 38'sd0;
             sc_E9      <= 9'sd0;
+            rsq_pipe_phase <= 2'd0;
+            rsq_ip_r   <= 26'sd0;
+            rsq_r0_r   <= 34'sd0;
+            rsq_r1_r   <= 64'sd0;
             acc_r      <= 64'sd0;
+            dot_prod_r <= 64'sd0;
+            dot_prod_valid_r <= 1'b0;
+            dot_prod_last_r  <= 1'b0;
+            mx_r       <= 64'sd0;
             ea_r       <= 32'sd0;
             se_r       <= 29'd0;
             rec_r      <= 21'd0;
@@ -882,6 +1055,9 @@ module msh_vec (
             div_q      <= 60'd0;
             div_b      <= 6'd0;
             yw         <= 96'd0;
+            ew_mul_p_r <= 256'd0;
+            ew_base_r  <= 128'd0;
+            ew_lut_r   <= 128'd0;
             ew_x1      <= 128'd0;
             ew_x2      <= 128'd0;
             ew_x3      <= 128'd0;
@@ -900,23 +1076,28 @@ module msh_vec (
             ew_v5      <= 1'b0;
             ew_v6      <= 1'b0;
             ew_v7      <= 1'b0;
+            ew_v8      <= 1'b0;
             ew_w3      <= 12'd0;
             ew_w4      <= 12'd0;
             ew_w5      <= 12'd0;
             ew_w6      <= 12'd0;
             ew_w7      <= 12'd0;
             ew_w8      <= 12'd0;
+            ew_w9      <= 12'd0;
             serv       <= 2'd0;
             mw_wsel    <= 32'd0;
             pa_t       <= 1'b0;
             pa_d1      <= 1'b0;
             pa_d2      <= 1'b0;
             pa_d3      <= 1'b0;
+            pa_d4      <= 1'b0;
             pa_i1      <= 12'd0;
             pa_i2      <= 12'd0;
             pa_i3      <= 12'd0;
+            pa_i4      <= 12'd0;
             pa_h       <= 8'd0;
             pa_hc      <= 12'd0;
+            pa_prod_r  <= 64'sd0;
             dtb_r      <= 16'd0;
             fx_r       <= 128'd0;
             win0       <= 128'd0;
@@ -930,6 +1111,28 @@ module msh_vec (
             cv_t       <= 2'd0;
             cv_y       <= 64'sd0;
             cv_yq      <= 64'sd0;
+            cv_prod_r      <= 64'sd0;
+            cv_prod2_r     <= 64'sd0;
+            cv_pair_sum_r  <= 64'sd0;
+            cv_mac_x_r     <= 32'sd0;
+            cv_mac_x2_r    <= 32'sd0;
+            cv_mac_w_r     <= 16'sd0;
+            cv_mac_w2_r    <= 16'sd0;
+            cv_mac_valid   <= 1'b0;
+            cv_mac_ml_r    <= 2'd0;
+            cv_mac_mt_r    <= 2'd0;
+            cv_mac_wi_r    <= 9'd0;
+            cv_mac_last_r  <= 1'b0;
+            cv_prod_valid  <= 1'b0;
+            cv_pair_valid  <= 1'b0;
+            cv_prod_ml_r   <= 2'd0;
+            cv_prod_mt_r   <= 2'd0;
+            cv_pair_ml_r   <= 2'd0;
+            cv_pair_mt_r   <= 2'd0;
+            cv_prod_wi_r   <= 9'd0;
+            cv_pair_wi_r   <= 9'd0;
+            cv_prod_last_r <= 1'b0;
+            cv_pair_last_r <= 1'b0;
             cv_yq1     <= 64'sd0;
             cv_yq2     <= 64'sd0;
             cv_lut_req <= 1'b0;
@@ -944,6 +1147,17 @@ module msh_vec (
             cv_last0   <= 1'b0;
             cv_last1   <= 1'b0;
             cv_last2   <= 1'b0;
+            cv_y1_r    <= 34'sd0;
+            cv_ll_y_r  <= 27'd0;
+            cv_scale_prod_r <= 62'sd0;
+            cv_scale_v0 <= 1'b0;
+            cv_scale_v1 <= 1'b0;
+            cv_scale_si0 <= 2'd0;
+            cv_scale_si1 <= 2'd0;
+            cv_scale_wi0 <= 9'd0;
+            cv_scale_wi1 <= 9'd0;
+            cv_scale_last0 <= 1'b0;
+            cv_scale_last1 <= 1'b0;
             hist_base  <= 18'd0;
             clr_cnt    <= 14'd0;
             h_addr     <= 14'd0;
@@ -969,6 +1183,10 @@ module msh_vec (
             is_v1      <= 1'b0;
             is_v2      <= is_v1;
             is_i2      <= is_i1;
+            dot_prod_valid_r <= 1'b0;
+            dot_prod_last_r  <= 1'b0;
+            sm_mac_valid_r <= 1'b0;
+            sm_fin_valid_r <= 1'b0;
             serv       <= serv + 2'd1;
             if (cv_active) begin
                 cv_sv    <= {cv_sv[1:0], cv_lut_req};
@@ -976,27 +1194,82 @@ module msh_vec (
                 cv_si2   <= cv_si1;
                 cv_wi1   <= cv_wi0;
                 cv_wi2   <= cv_wi1;
-                cv_last1 <= cv_last0;
-                cv_last2 <= cv_last1;
-                cv_yq1   <= cv_yq;
-                cv_yq2   <= cv_yq1;
+            cv_last1 <= cv_last0;
+            cv_last2 <= cv_last1;
+            cv_yq1   <= cv_yq;
+            cv_yq2   <= cv_yq1;
+        end
+            cv_scale_v0 <= cv_active && cv_sv[2];
+            cv_scale_v1 <= cv_scale_v0;
+            if (cv_active && cv_sv[2]) begin
+                cv_y1_r        <= cv_y1;
+                cv_ll_y_r      <= ll_y_flat[26:0];
+                cv_scale_si0   <= cv_si2;
+                cv_scale_wi0   <= cv_wi2;
+                cv_scale_last0 <= cv_last2;
+            end
+            if (cv_scale_v0) begin
+                cv_scale_prod_r <= cv_scale_prod;
+                cv_scale_si1    <= cv_scale_si0;
+                cv_scale_wi1    <= cv_scale_wi0;
+                cv_scale_last1  <= cv_scale_last0;
+            end
+            cv_mac_valid  <= cv_active && is_v2;
+            cv_prod_valid <= cv_mac_valid;
+            cv_pair_valid <= cv_prod_valid;
+            if (cv_active && is_v2) begin
+                cv_mac_x_r     <= cv_in_x;
+                cv_mac_w_r     <= cv_in_w;
+                cv_mac_x2_r    <= cv_in_x2;
+                cv_mac_w2_r    <= cv_in_w2;
+                cv_mac_ml_r    <= cap_ml;
+                cv_mac_mt_r    <= cap_mt;
+                cv_mac_wi_r    <= cnt[8:0];
+                cv_mac_last_r <= (cnt == {1'b0, nwords_r} - 12'd1)
+                                  && (cap_ml == 2'd3);
+            end
+            if (cv_mac_valid) begin
+                cv_prod_r      <= cv_prod;
+                cv_prod2_r     <= cv_prod2;
+                cv_prod_ml_r   <= cv_mac_ml_r;
+                cv_prod_mt_r   <= cv_mac_mt_r;
+                cv_prod_wi_r   <= cv_mac_wi_r;
+                cv_prod_last_r <= cv_mac_last_r;
+            end
+            if (cv_prod_valid) begin
+                cv_pair_sum_r  <= cv_pair_sum;
+                cv_pair_ml_r   <= cv_prod_ml_r;
+                cv_pair_mt_r   <= cv_prod_mt_r;
+                cv_pair_wi_r   <= cv_prod_wi_r;
+                cv_pair_last_r <= cv_prod_last_r;
+            end
+            if (cv_pair_valid) begin
+                cv_y <= cv_yfin;
+                if (cv_push) begin
+                    cv_yq      <= cv_yfin;
+                    cv_lut_req <= 1'b1;
+                    cv_lut_val <= cv_yfin;
+                    cv_si0     <= cv_pair_ml_r;
+                    cv_wi0     <= cv_pair_wi_r;
+                    cv_last0   <= cv_pair_last_r;
+                end
             end
             // conv output stage (runs in every conv state)
-            if (cv_active && cv_sv[2]) begin
+            if (cv_active && cv_scale_v1) begin
 `ifdef MSH_DEBUG
                 $display("[vec] xw si=%0d wi=%0d out=%08x yq=%016x ll_y=%08x last=%0d",
-                         cv_si2, cv_wi2, cv_out, cv_yq, ll_y_flat[31:0], cv_last2);
+                         cv_scale_si1, cv_scale_wi1, cv_out, cv_yq, cv_ll_y_r, cv_scale_last1);
 `endif
-                case (cv_si2)
+                case (cv_scale_si1)
                     2'd0: yw[31:0]  <= cv_out;
                     2'd1: yw[63:32] <= cv_out;
                     2'd2: yw[95:64] <= cv_out;
                     default: ;
                 endcase
-                if (cv_si2 == 2'd3) begin
+                if (cv_scale_si1 == 2'd3) begin
                     xw_we   <= 1'b1;
-                    xw_addr <= {odst, cv_wi2};
-                    xw_mask <= (cv_last2 && (olen[1:0] != 2'd0))
+                    xw_addr <= {odst, cv_scale_wi1};
+                    xw_mask <= (cv_scale_last1 && (olen[1:0] != 2'd0))
                              ? tail_m : 4'b1111;
                     xw_data <= {cv_out, yw[95:0]};
                 end
@@ -1018,6 +1291,10 @@ module msh_vec (
                 S_IDLE: begin
                     if (op_valid) begin
                         oc       <= op_code;
+                        ew_is_silu <= (op_code == OP_SILU);
+                        ew_is_add  <= (op_code == OP_ADD);
+                        ew_is_mulz <= (op_code == OP_MULZ);
+                        ew_is_macw <= (op_code == OP_MACW);
                         olen     <= op_len;
                         osrc1    <= op_src1;
                         osrc2    <= op_src2;
@@ -1033,7 +1310,12 @@ module msh_vec (
                         cnt      <= 12'd0;
                         case (op_code)
                             OP_RMSNORM: begin
+                                n2_apply_v1 <= 1'b0;
+                                n2_apply_v2 <= 1'b0;
                                 ss_acc <= 80'd0;
+                                ssq_v1 <= 1'b0;
+                                ssq_v2 <= 1'b0;
+                                ssq_v3 <= 1'b0;
                                 if (op_len == idm_d) begin
                                     // memoized quotient: skip the divider
                                     invd24_r <= idm_q;
@@ -1050,7 +1332,12 @@ module msh_vec (
                                 end
                             end
                             OP_L2NORM: begin
+                                n2_apply_v1 <= 1'b0;
+                                n2_apply_v2 <= 1'b0;
                                 ss_acc <= 80'd0;
+                                ssq_v1 <= 1'b0;
+                                ssq_v2 <= 1'b0;
+                                ssq_v3 <= 1'b0;
                                 cnt    <= {2'b0, op_aux[11:2]};
                                 state  <= S_SSQ;
                             end
@@ -1059,22 +1346,32 @@ module msh_vec (
                                 ew_v2 <= 1'b0;
                                 ew_v3 <= 1'b0;
                                 ew_v4 <= 1'b0;
+                                ew_v5 <= 1'b0;
+                                ew_v6 <= 1'b0;
+                                ew_v7 <= 1'b0;
+                                ew_v8 <= 1'b0;
                                 state <= S_EW;
                             end
                             OP_MACW: begin
                                 ew_v2 <= 1'b0;
                                 ew_v3 <= 1'b0;
                                 ew_v4 <= 1'b0;
+                                ew_v5 <= 1'b0;
+                                ew_v6 <= 1'b0;
+                                ew_v7 <= 1'b0;
+                                ew_v8 <= 1'b0;
                                 state <= S_MWLD;
                             end
                             OP_DOT: begin
-                                acc_r <= 64'sd0;
+                                acc_r            <= 64'sd0;
+                                dot_prod_valid_r <= 1'b0;
+                                dot_prod_last_r  <= 1'b0;
                                 state <= S_DOT;
                             end
                             OP_SMIX: begin
                                 cand_i <= 3'd0;
                                 se_r   <= 29'd0;
-                                state  <= S_SM_EA;
+                                state  <= S_SM_EA_MAX;
                             end
                             OP_TOPK: begin
                                 ssum_r <= 32'd0;
@@ -1085,8 +1382,10 @@ module msh_vec (
                                 pa_d1 <= 1'b0;
                                 pa_d2 <= 1'b0;
                                 pa_d3 <= 1'b0;
+                                pa_d4 <= 1'b0;
                                 pa_h  <= 8'd0;
                                 pa_hc <= 12'd0;
+                                pa_prod_r <= 64'sd0;
                                 state <= S_PA;
                             end
                             OP_CONV: begin
@@ -1117,17 +1416,40 @@ module msh_vec (
                 end
                 // ----------------------------------------------------
                 S_SSQ: begin
+                    ssq_v1 <= is_v2;
+                    ssq_v2 <= ssq_v1;
+                    ssq_v3 <= ssq_v2;
+                    if (is_v2) begin
+                        ssq_p0_r  <= sq_v0 ? sq_p0 : 64'd0;
+                        ssq_p1_r  <= sq_v1 ? sq_p1 : 64'd0;
+                        ssq_p2_r  <= sq_v2 ? sq_p2 : 64'd0;
+                        ssq_p3_r  <= sq_v3 ? sq_p3 : 64'd0;
+                        ssq_idx1  <= is_i2;
+                        ssq_last1 <= (is_i2 == sq_wlast);
+                    end
+                    if (ssq_v1) begin
+                        ssq_pair01_r <= ssq_pair01_next;
+                        ssq_pair23_r <= ssq_pair23_next;
+                        ssq_idx2     <= ssq_idx1;
+                        ssq_last2    <= ssq_last1;
+                    end
+                    if (ssq_v2) begin
+                        ssq_total_r <= ssq_total_next;
+                        ssq_idx3   <= ssq_idx2;
+                        ssq_last3  <= ssq_last2;
+                    end
                     if (cnt <= sq_wlast) begin
                         xa_addr <= {osrc1, cnt[8:0]};
                         cnt     <= cnt + 12'd1;
                         is_v1   <= 1'b1;
                         is_i1   <= cnt;
                     end
-                    if (is_v2) begin
-                        ss_acc <= ss_acc + {13'b0, sq_all};
-                        if (is_i2 == sq_wlast) state <= S_VAR;
+                    if (ssq_v3) begin
+                        ss_acc <= ss_acc + {13'b0, ssq_total_r};
+                        if (ssq_last3) state <= S_VAR;
 `ifdef MSH_DEBUG
-                        $display("[vec] SSQ i=%0d x=%032x", is_i2, xa_data);
+                        $display("[vec] SSQ i=%0d sum=%017x last=%0d",
+                                 ssq_idx3, ssq_total_r, ssq_last3);
 `endif
                     end
                 end
@@ -1145,11 +1467,34 @@ module msh_vec (
                                     scm_rsq_d[15:0]};
                         sc_frac <= {9'b0, n_frac};
                         sc_E9   <= n_E9;
+                        rsq_pipe_phase <= 2'd0;
                         sc_st   <= 1'b1;
                     end else begin
-                        rsq_r <= r_c;
-                        cnt   <= 12'd0;
-                        state <= S_NORM2;
+                        case (rsq_pipe_phase)
+                            2'd0: begin
+                                rsq_ip_r <= sc_ip;
+                                rsq_pipe_phase <= 2'd1;
+                            end
+                            2'd1: begin
+                                rsq_r0_r <= $signed({1'b0, sc_t})
+                                          + $signed({{8{rsq_ip_r[25]}},
+                                                     rsq_ip_r});
+                                rsq_pipe_phase <= 2'd2;
+                            end
+                            2'd2: begin
+                                rsq_r1_r <= rsq_r1_pipe;
+                                rsq_pipe_phase <= 2'd3;
+                            end
+                            default: begin
+                                rsq_r <= rsq_final_pipe;
+                                cnt   <= 12'd0;
+                                sc_st <= 1'b0;
+                                rsq_pipe_phase <= 2'd0;
+                                n2_apply_v1 <= 1'b0;
+                                n2_apply_v2 <= 1'b0;
+                                state <= S_NORM2;
+                            end
+                        endcase
                     end
                 end
                 // ----------------------------------------------------
@@ -1162,29 +1507,44 @@ module msh_vec (
                         is_v1   <= 1'b1;
                         is_i1   <= n2_e;
                     end
+                    n2_apply_v1 <= is_v2;
+                    n2_apply_v2 <= n2_apply_v1;
                     if (is_v2) begin
-                        case (ed_c[1:0])
-                            2'd0: yw[31:0]  <= n2_y;
-                            2'd1: yw[63:32] <= n2_y;
-                            2'd2: yw[95:64] <= n2_y;
+                        n2_xs_r          <= n2_xs[31:0];
+                        n2_rg_r          <= n2_rg[43:0];
+                        n2_apply_dst1   <= ed_c;
+                        n2_apply_mask1  <= dw_m;
+                        n2_apply_last1  <= (is_i2 == n2_last);
+                    end
+                    if (n2_apply_v1) begin
+                        n2_yf_r          <= n2_apply_yf;
+                        n2_apply_dst2   <= n2_apply_dst1;
+                        n2_apply_mask2  <= n2_apply_mask1;
+                        n2_apply_last2  <= n2_apply_last1;
+                    end
+                    if (n2_apply_v2) begin
+                        case (n2_apply_dst2[1:0])
+                            2'd0: yw[31:0]  <= n2_apply_y;
+                            2'd1: yw[63:32] <= n2_apply_y;
+                            2'd2: yw[95:64] <= n2_apply_y;
                             default: ;
                         endcase
 `ifdef MSH_DEBUG
-                        $display("[vec] N2 i=%0d x=%08x w=%04x rg=%0d y=%08x",
-                                 is_i2, n2_x32, w_data, n2_rg, n2_y);
+                        $display("[vec] N2 dst=%0d y=%08x last=%0d",
+                                 n2_apply_dst2, n2_apply_y, n2_apply_last2);
 `endif
-                        if ((ed_c[1:0] == 2'd3) || (is_i2 == n2_last)) begin
+                        if ((n2_apply_dst2[1:0] == 2'd3) || n2_apply_last2) begin
                             xw_we   <= 1'b1;
-                            xw_addr <= {odst, ed_c[10:2]};
-                            xw_mask <= dw_m;
-                            case (ed_c[1:0])
-                                2'd0: xw_data <= {96'd0, n2_y};
-                                2'd1: xw_data <= {64'd0, n2_y, yw[31:0]};
-                                2'd2: xw_data <= {32'd0, n2_y, yw[63:0]};
-                                default: xw_data <= {n2_y, yw[95:0]};
+                            xw_addr <= {odst, n2_apply_dst2[10:2]};
+                            xw_mask <= n2_apply_mask2;
+                            case (n2_apply_dst2[1:0])
+                                2'd0: xw_data <= {96'd0, n2_apply_y};
+                                2'd1: xw_data <= {64'd0, n2_apply_y, yw[31:0]};
+                                2'd2: xw_data <= {32'd0, n2_apply_y, yw[63:0]};
+                                default: xw_data <= {n2_apply_y, yw[95:0]};
                             endcase
                         end
-                        if (is_i2 == n2_last) state <= S_DONE;
+                        if (n2_apply_last2) state <= S_DONE;
                     end
                 end
                 // ----------------------------------------------------
@@ -1193,7 +1553,8 @@ module msh_vec (
                     // -> capture at serv==3, values valid at serv==0,
                     // lane k served by the shared ROM at serv==k); plain
                     // arithmetic ops (ADD/MULZ/MACW) issue every cycle —
-                    // their chain is data-only and ll_y is unused
+                    // their chain is data-only; EW arithmetic results drain
+                    // through the registered product stage below
                     if ((cnt < {1'b0, nwords_r})
                         && ((serv == 2'd1) || !ew_lut)) begin
                         xa_addr <= {osrc1, cnt[8:0]};
@@ -1209,12 +1570,14 @@ module msh_vec (
                     ew_v5 <= ew_v4;
                     ew_v6 <= ew_v5;
                     ew_v7 <= ew_v6;
+                    ew_v8 <= ew_v7 && ew_pipe_mode;
                     ew_w3 <= is_i2;
                     ew_w4 <= ew_w3;
                     ew_w5 <= ew_w4;
                     ew_w6 <= ew_w5;
                     ew_w7 <= ew_w6;
                     ew_w8 <= ew_w7;
+                    ew_w9 <= ew_w8;
                     ew_x1 <= xa_data;
                     ew_x2 <= ew_x1;
                     ew_x3 <= ew_x2;
@@ -1227,14 +1590,26 @@ module msh_vec (
                     ew_b4 <= ew_b3;
                     ew_b5 <= ew_b4;
                     ew_b6 <= ew_b5;
-                    if (ew_v7) begin
+                    ew_mul_p_r <= ew_mul_p_flat;
+                    ew_base_r  <= ew_base_flat;
+                    ew_lut_r   <= ll_y_flat;
+                    if (ew_v7 && !ew_pipe_mode) begin
                         xw_we   <= 1'b1;
                         xw_addr <= {odst, ew_w8[8:0]};
-                        xw_data <= ew_y_flat;
+                        xw_data <= ll_y_flat;
                         xw_mask <= ((ew_w8 == {1'b0, nwords_r} - 12'd1)
                                     && (olen[1:0] != 2'd0))
                                  ? tail_m : 4'b1111;
                         if (ew_w8 == {1'b0, nwords_r} - 12'd1) state <= S_DONE;
+                    end
+                    if (ew_v8) begin
+                        xw_we   <= 1'b1;
+                        xw_addr <= {odst, ew_w9[8:0]};
+                        xw_data <= ew_y_flat;
+                        xw_mask <= ((ew_w9 == {1'b0, nwords_r} - 12'd1)
+                                    && (olen[1:0] != 2'd0))
+                                 ? tail_m : 4'b1111;
+                        if (ew_w9 == {1'b0, nwords_r} - 12'd1) state <= S_DONE;
                     end
                 end
                 // ----------------------------------------------------
@@ -1262,14 +1637,24 @@ module msh_vec (
                         is_i1   <= cnt;
                     end
                     if (is_v2) begin
+                        dot_prod_r       <= dt_prod;
+                        dot_prod_valid_r <= 1'b1;
+                        dot_prod_last_r  <= (is_i2 == olen - 12'd1);
+                    end
+                    if (dot_prod_valid_r) begin
                         acc_r <= dt_acc;
-                        if (is_i2 == olen - 12'd1) begin
+                        if (dot_prod_last_r) begin
                             log_r_v[64*(oaux[1:0]) +: 64] <= dt_acc;
                             dot_val          <= dt_acc;
                             dot_valid        <= 1'b1;
                             state            <= S_DONE;
                         end
                     end
+                end
+                // ----------------------------------------------------
+                S_SM_EA_MAX: begin
+                    mx_r  <= mx_c;
+                    state <= S_SM_EA;
                 end
                 // ----------------------------------------------------
                 S_SM_EA: begin
@@ -1283,9 +1668,15 @@ module msh_vec (
                         sc_t    <= {6'b0, scm_sexp_t[26:0]};
                         sc_d    <= scm_sexp_d[19:0];
                         sc_frac <= ea_r[17:0];
+                        sm_exp_dp_r <= sm_exp_dp_next;
                         sc_st   <= 1'b1;
                     end else begin
-                        e_r_v[27*(cand_i[1:0]) +: 27] <= e_c;
+                        case (cand_i[1:0])
+                            2'd0: e_r_v[26:0]   <= e_c;
+                            2'd1: e_r_v[53:27]  <= e_c;
+                            2'd2: e_r_v[80:54]  <= e_c;
+                            default: e_r_v[107:81] <= e_c;
+                        endcase
                         se_r             <= se_r + {2'b0, e_c};
                         if (cand_i == ncand_r[2:0] - 3'd1) begin
                             sc_st <= 1'b0;
@@ -1306,7 +1697,7 @@ module msh_vec (
                         sc_E9   <= n_E9;
                         sc_st   <= 1'b1;
                     end else begin
-                        rec_r  <= rec_c[20:0];
+                        rec_r  <= rec_narrow_c;
                         cnt    <= 12'd0;
                         cand_i <= 3'd0;
                         for (ri = 0; ri < 4; ri = ri + 1)
@@ -1316,6 +1707,12 @@ module msh_vec (
                 end
                 // ----------------------------------------------------
                 S_SM_MAC: begin
+                    if (sm_fin_valid_r) begin
+                        xw_we   <= 1'b1;
+                        xw_addr <= {odst, sm_fin_cnt_r[8:0]};
+                        xw_data <= {fin_y3, fin_y2, fin_y1, fin_y0};
+                        xw_mask <= sm_fin_mask_r;
+                    end
                     if (cand_i < ncand_r[2:0]) begin
                         xa_addr <= {sm_buf, cnt[8:0]};
                         is_v1   <= 1'b1;
@@ -1323,30 +1720,57 @@ module msh_vec (
                         cand_i  <= cand_i + 3'd1;
                     end
                     if (is_v2) begin
-                        acc_l_v[64*(0) +: 64] <= acc_l_v[64*(0) +: 64] + mac_p0;
-                        acc_l_v[64*(1) +: 64] <= acc_l_v[64*(1) +: 64] + mac_p1;
-                        acc_l_v[64*(2) +: 64] <= acc_l_v[64*(2) +: 64] + mac_p2;
-                        acc_l_v[64*(3) +: 64] <= acc_l_v[64*(3) +: 64] + mac_p3;
-                        if (is_i2[2:0] == ncand_r[2:0] - 3'd1)
+                        sm_mac_p0_r <= {{5{mac_p0[58]}}, mac_p0};
+                        sm_mac_p1_r <= {{5{mac_p1[58]}}, mac_p1};
+                        sm_mac_p2_r <= {{5{mac_p2[58]}}, mac_p2};
+                        sm_mac_p3_r <= {{5{mac_p3[58]}}, mac_p3};
+                        sm_mac_last_r <= (is_i2[2:0]
+                                          == ncand_r[2:0] - 3'd1);
+                        sm_mac_valid_r <= 1'b1;
+                    end
+                    if (sm_mac_valid_r) begin
+                        acc_l_v[64*(0) +: 64] <= acc_l_v[64*(0) +: 64] + sm_mac_p0_r;
+                        acc_l_v[64*(1) +: 64] <= acc_l_v[64*(1) +: 64] + sm_mac_p1_r;
+                        acc_l_v[64*(2) +: 64] <= acc_l_v[64*(2) +: 64] + sm_mac_p2_r;
+                        acc_l_v[64*(3) +: 64] <= acc_l_v[64*(3) +: 64] + sm_mac_p3_r;
+                        if (sm_mac_last_r)
                             state <= S_SM_FIN;
                     end
                 end
                 // ----------------------------------------------------
                 S_SM_FIN: begin
-                    xw_we   <= 1'b1;
-                    xw_addr <= {odst, cnt[8:0]};
-                    xw_data <= {fin_y3, fin_y2, fin_y1, fin_y0};
-                    xw_mask <= ((cnt == {1'b0, nwords_r} - 12'd1)
-                                && (olen[1:0] != 2'd0))
-                             ? tail_m : 4'b1111;
+                    // Register the completed accumulator's scaled product.
+                    // The rounding/saturation network runs during the next
+                    // MAC word, while the previous word writes.
+                    sm_fin_prod0_r <= $signed(fin_ys_n0) * $signed({1'b0, rec_r});
+                    sm_fin_prod1_r <= $signed(fin_ys_n1) * $signed({1'b0, rec_r});
+                    sm_fin_prod2_r <= $signed(fin_ys_n2) * $signed({1'b0, rec_r});
+                    sm_fin_prod3_r <= $signed(fin_ys_n3) * $signed({1'b0, rec_r});
+                    sm_fin_cnt_r <= cnt;
+                    sm_fin_mask_r <= ((cnt == {1'b0, nwords_r} - 12'd1)
+                                      && (olen[1:0] != 2'd0))
+                                   ? tail_m : 4'b1111;
+                    sm_fin_valid_r <= 1'b1;
                     if (cnt == {1'b0, nwords_r} - 12'd1) begin
-                        state <= S_DONE;
+                        state <= S_SM_OUT;
                     end else begin
                         cnt    <= cnt + 12'd1;
                         cand_i <= 3'd0;
                         for (ri = 0; ri < 4; ri = ri + 1)
                             acc_l_v[64*(ri) +: 64] <= 64'sd0;
                         state  <= S_SM_MAC;
+                    end
+                end
+                // ----------------------------------------------------
+                S_SM_OUT: begin
+                    // Drain the final scaled word before the normal done
+                    // pulse. Non-final words are written from S_SM_MAC.
+                    if (sm_fin_valid_r) begin
+                        xw_we   <= 1'b1;
+                        xw_addr <= {odst, sm_fin_cnt_r[8:0]};
+                        xw_data <= {fin_y3, fin_y2, fin_y1, fin_y0};
+                        xw_mask <= sm_fin_mask_r;
+                        state   <= S_DONE;
                     end
                 end
                 // ----------------------------------------------------
@@ -1487,33 +1911,40 @@ module msh_vec (
                     end
                     pa_d2 <= pa_d1;
                     pa_d3 <= pa_d2;
+                    pa_d4 <= pa_d3;
                     pa_i2 <= pa_i1;
                     pa_i3 <= pa_i2;
+                    pa_i4 <= pa_i3;
                     if (pa_d2) begin
                         dtb_r <= w_data;
                         fx_r  <= xa_data;
                     end
                     if (pa_d3) begin
-                        case (pa_lane)
+                        // Register the wide product so WBUF data no longer
+                        // drives multiply, rounding, and writeback together.
+                        pa_prod_r <= pa_prod;
+                    end
+                    if (pa_d4) begin
+                        case (pa_lane4)
                             2'd0: yw[31:0]  <= pa_arg;
                             2'd1: yw[63:32] <= pa_arg;
                             2'd2: yw[95:64] <= pa_arg;
                             default: ;
                         endcase
-                        if ((pa_lane == 2'd3) || (pa_i3 == olen - 12'd1)) begin
+                        if ((pa_lane4 == 2'd3) || (pa_i4 == olen - 12'd1)) begin
                             xw_we   <= 1'b1;
-                            xw_addr <= {odst, pa_i3[10:2]};
-                            xw_mask <= ((pa_i3 == olen - 12'd1)
+                            xw_addr <= {odst, pa_i4[10:2]};
+                            xw_mask <= ((pa_i4 == olen - 12'd1)
                                         && (olen[1:0] != 2'd0))
                                      ? tail_m : 4'b1111;
-                            case (pa_lane)
+                            case (pa_lane4)
                                 2'd0: xw_data <= {96'd0, pa_arg};
                                 2'd1: xw_data <= {64'd0, pa_arg, yw[31:0]};
                                 2'd2: xw_data <= {32'd0, pa_arg, yw[63:0]};
                                 default: xw_data <= {pa_arg, yw[95:0]};
                             endcase
                         end
-                        if (pa_i3 == olen - 12'd1) state <= S_DONE;
+                        if (pa_i4 == olen - 12'd1) state <= S_DONE;
                     end
                 end
                 // ----------------------------------------------------
@@ -1576,36 +2007,11 @@ module msh_vec (
                         end else begin
                             cv_t <= cv_t + 2'd2;
                         end
-                        // capture aligned to the read pipeline (is_v2)
-                        if (is_v2) begin
-                            cv_y <= cv_yfin;
-                            if (cv_push) begin
-                                cv_yq      <= cv_yfin;
-                                cv_lut_req <= 1'b1;
-                                cv_lut_val <= cv_yfin;
-                                cv_si0     <= cap_ml;
-                                cv_wi0     <= cnt[8:0];
-                                cv_last0   <= (cnt == {1'b0, nwords_r} - 12'd1)
-                                              && (cap_ml == 2'd3);
-                            end
-                        end
                     end
                 end
                 // ----------------------------------------------------
                 S_CV_FIN: begin
                     // drain the final tap of the last element of the word
-                    if (is_v2) begin
-                        cv_y <= cv_yfin;
-                        if (cv_push) begin
-                            cv_yq      <= cv_yfin;
-                            cv_lut_req <= 1'b1;
-                            cv_lut_val <= cv_yfin;
-                            cv_si0     <= cap_ml;
-                            cv_wi0     <= cnt[8:0];
-                            cv_last0   <= (cnt == {1'b0, nwords_r} - 12'd1)
-                                          && (cap_ml == 2'd3);
-                        end
-                    end
                     if (!is_v2) begin
                         if (cnt == {1'b0, nwords_r} - 12'd1) begin
                             state <= S_CV_DR;
@@ -1618,7 +2024,8 @@ module msh_vec (
                 end
                 // ----------------------------------------------------
                 S_CV_DR: begin
-                    if (cv_sv[2] && cv_last2 && (cv_si2 == 2'd3)) begin
+                    if (cv_scale_v1 && cv_scale_last1
+                        && (cv_scale_si1 == 2'd3)) begin
                         hist_base[2*cv_ls[3:0] +: 2] <= cv_nbs;
                         state <= S_DONE;
                     end
@@ -1647,14 +2054,13 @@ module msh_vec (
                        E9b_f[8], E9b_f[0], sc_E9[8:7], n_E[7:6],
                        n_mq64[63:21], var_pr[43:0], var_l2s[19:0],
                        exp_y[37:27], dvd_c[60], div_rem_n[31],
-                       rec_c[63:21], nv0[0], acc_nw14[13:11],
+                        rec_c, rec_right_c[56:21], nv0[0], acc_nw14[13:11],
                        sl0[7:5], sl1[7:5], sl2[7:5], dd13[12],
                        n2_e13[12], n2l13[12], ed13[12], id_rem_n[12:11],
                        sq_wl14[13:12], cv_wa16[15], cv_ls8[7:6],
                        h_addr[8:4], rsq_r[63:40], n2_g64[63:17],
-                       n2_rg[63:44], n2_xs[63:32], mac_e[63:27],
-                       mac_l0[63:32], mac_l1[63:32], mac_l2[63:32],
-                       mac_l3[63:32], win_lane[63:32], cv_y1[63:48],
+                        n2_rg[63:44], n2_xs[63:32], win_lane[63:32], cv_yq2[63:50],
+                       cv_yq2[14:0], cv_scale_prod[19:0],
                        fin_ys0[63:40], fin_ys1[63:40], fin_ys2[63:40],
                        fin_ys3[63:40],
                        scm_rsq_d[40:16], scm_rec_d[24:16],

@@ -26,7 +26,7 @@
 // KV cache at position `pos` (both streams in parallel on the two read
 // ports — K side reads kc then kr per head, V side reads v), then
 // computes attention for each head over t = 0..pos: att (4 dims/cycle),
-// exp (1 t/cycle), recip (1 cycle), ctx accumulation (4 dims/cycle,
+// exp (1 t/cycle), staged recip normalization, ctx accumulation (4 dims/cycle,
 // set-on-first accumulators), ctx writeout (4 int32 lanes/word). ctx is
 // written to the ctx buffer (head-major). The output GEMV (L.mla.o) is
 // done elsewhere; this module stops at ctx.
@@ -37,13 +37,13 @@
 // (nwk = dqk/4), V word = (hd*128 + t)*nwv + w. Both cleared by a reset
 // write-loop (randreset gate) before the first job is accepted. The LUTs
 // are harness msh_rom macros (ASYNC read, same-cycle data — the exp/recip
-// datapaths keep their original single-cycle structure). All other
+// datapaths stage arithmetic around the ROM access). All other
 // storage is packed vectors (no inferred $mem).
 //
 // ST_ATT/ST_CTX are retimed around the 1-cycle KV read: the word address
 // is issued with (t, w) and the returned word is consumed one cycle
-// later with the delayed (at_td/c_td, at_wd/c_wd) — initiation interval
-// 1, one drain cycle per pass.
+// later with the delayed (at_td/c_td, at_wd/c_wd). The tagged datapaths
+// retain initiation interval 1; flush states drain their final results.
 //
 // Documented assumptions:
 //   * dk, dr, dv are multiples of 4 and > 0; dqk = dk + dr <= 192;
@@ -95,11 +95,13 @@ module msh_mla (
     localparam ST_STORE = 4'd2;         // k_new/v_new -> KV at pos
     localparam ST_QLOAD = 4'd3;         // per-head q preload
     localparam ST_ATT   = 4'd4;         // att[t] dot products
+    localparam ST_ATT_FLUSH = 4'd10;    // drain pipelined attention results
     localparam ST_EXP   = 4'd5;         // exp LUT + se
-    localparam ST_RECIP = 4'd6;         // reciprocal LUT
+    localparam ST_RECIP = 4'd6;         // staged reciprocal normalization
     localparam ST_CTX   = 4'd7;         // sum_t e[t]*V[t][d]
     localparam ST_CTXW  = 4'd8;         // ctx writeout
     localparam ST_DONE  = 4'd9;
+    localparam ST_CTXW_DRAIN = 4'd11;   // drain pipelined ctx writeback
 
     reg [3:0] state;
 
@@ -120,7 +122,7 @@ module msh_mla (
     reg [5:0]  w;
     reg signed [71:0] acc;              // att dot-product accumulator
     reg signed [55:0] mx;               // running att max
-    reg [63:0] se;                      // sum of exp outputs
+    reg [35:0] se;                      // sum of exp outputs (<= 512*2^26)
     reg signed [47:0] rec;              // round(2^46/se)
     reg [16:0] clr;
 
@@ -141,6 +143,18 @@ module msh_mla (
     reg        att_iss, at_dv;
     reg [8:0]  at_td;
     reg [5:0]  at_wd;
+    reg        att_round_valid, att_mul_valid;
+    reg        att_dot_valid, att_acc_valid;
+    reg        att_round_first, att_round_last;
+    reg        att_round_tfirst, att_round_tlast;
+    reg [8:0]  att_round_td;
+    reg        att_mul_first, att_mul_last;
+    reg        att_mul_tfirst, att_mul_tlast;
+    reg [8:0]  att_mul_td;
+    reg        att_dot_first, att_dot_last, att_dot_tfirst, att_dot_tlast;
+    reg        att_acc_last, att_acc_tfirst, att_acc_tlast;
+    reg [8:0]  att_dot_td, att_acc_td;
+    reg signed [79:0] att_dot_r, att_acc_stage;
     reg        ctx_iss, c_dv;
     reg [8:0]  c_td;
     reg [5:0]  c_wd;
@@ -193,13 +207,13 @@ module msh_mla (
 
     // packed-vector storage (no inferred $mem)
     reg [2047:0]  qbuf_v;               // 64 x int32 (dqk <= 64)
+    reg [127:0]   qword_r;              // prefetched four-lane q word
 
     // att/e/ctx storage as msh_sram macros (synchronous read; the
     // consumers are retimed one cycle — see ST_EXP/ST_CTX/ST_CTXW).
     // Macro bits replace ~47 Kflops of wide variable-index logic.
-    wire         atb_we    = (state == ST_ATT) && at_dv
-                           && (at_wd == j_nwk - 6'd1);
-    wire [6:0]   atb_waddr = at_td[6:0];
+    wire         atb_we    = att_acc_valid && att_acc_last;
+    wire [6:0]   atb_waddr = att_acc_td[6:0];
     wire [63:0]  atb_wd    = {8'b0, att_v[55:0]};
     wire [6:0]   atb_raddr = (state == ST_EXP) ? t[6:0] : 7'd0;
     wire [63:0]  atb_rd;
@@ -208,9 +222,9 @@ module msh_mla (
         .wstrb(8'hFF),
         .re(1'b1), .raddr(atb_raddr), .rdata(atb_rd));
 
-    wire         eb_we    = (state == ST_EXP) && e_dv;
-    wire [6:0]   eb_waddr = e_td[6:0];
-    wire [31:0]  eb_wd    = {5'b0, e_y[26:0]};
+    wire         eb_we    = (state == ST_EXP) && exp_tag5_r[11];
+    wire [6:0]   eb_waddr = exp_tag5_r[6:0];
+    wire [31:0]  eb_wd    = {5'b0, exp_y_r[26:0]};
     wire [6:0]   eb_raddr = (state == ST_CTX) ? t[6:0] : 7'd0;
     wire [31:0]  eb_rd;
     msh_sram #(.DEPTH(128), .WIDTH(32)) u_eb (
@@ -233,6 +247,22 @@ module msh_mla (
         .re(1'b1), .raddr(ad_raddr), .rdata(ad_rd));
     reg [8:0]  e_td;                  // ST_EXP delayed t (att data phase)
     reg        e_dv;
+    reg [11:0] exp_tag1_r, exp_tag2_r, exp_tag3_r, exp_tag4_r, exp_tag5_r;
+    reg signed [56:0] exp_diff_r;
+    reg [12:0] exp_idx_r;
+    reg [17:0] exp_frac1_r, exp_frac2_r;
+    reg signed [32:0] exp_delta_r;
+    reg [31:0] exp_base_r, exp_base2_r;
+    reg signed [39:0] exp_interp_r;
+    reg [27:0] exp_y_r;
+    reg [2:0] recip_phase;
+    reg [5:0] rc_e0_r, rc_amt_r;
+    reg signed [7:0] rc_E_r, rc_sh_r;
+    reg [63:0] rc_mq_r, rc_ru_r;
+    reg [11:0] rc_idx_r;
+    reg [8:0] rc_frac_r;
+    reg [23:0] rc_base_r;
+    reg signed [25:0] rc_di_r, rc_r_r;
     reg [4:0]  cw_wd;                 // ST_CTXW delayed word index
     reg        cw_dv;
 
@@ -243,7 +273,8 @@ module msh_mla (
     // final row whose delta is 0), so the deltas are computed on the
     // fly from tab[idx] and tab[idx+1] — bit-identical, and the two
     // _d ROMs are eliminated: deltas are computed on the fly from the
-    // endpoint ROM's two async read ports.
+    // endpoint ROM's two async read ports. The reciprocal pipeline registers
+    // its index before consuming the async endpoint data.
     wire [31:0] et_rd0, et_rd1;
     wire [23:0] rt_rd0, rt_rd1;
     wire [12:0] rom_e_idx;              // driven below with the exp index
@@ -277,11 +308,46 @@ module msh_mla (
     endfunction
 
     function [5:0] topbit64(input [63:0] v);
-        integer k;
+        reg [31:0] x32;
+        reg [15:0] x16;
+        reg [7:0] x8;
+        reg [3:0] x4;
+        reg [1:0] x2;
+        reg [5:0] idx;
         begin
-            topbit64 = 6'd0;
-            for (k = 0; k < 64; k = k + 1)
-                if (v[k]) topbit64 = k[5:0];
+            idx = 6'd0;
+            if (|v[63:32]) begin
+                idx[5] = 1'b1;
+                x32 = v[63:32];
+            end else begin
+                x32 = v[31:0];
+            end
+            if (|x32[31:16]) begin
+                idx[4] = 1'b1;
+                x16 = x32[31:16];
+            end else begin
+                x16 = x32[15:0];
+            end
+            if (|x16[15:8]) begin
+                idx[3] = 1'b1;
+                x8 = x16[15:8];
+            end else begin
+                x8 = x16[7:0];
+            end
+            if (|x8[7:4]) begin
+                idx[2] = 1'b1;
+                x4 = x8[7:4];
+            end else begin
+                x4 = x8[3:0];
+            end
+            if (|x4[3:2]) begin
+                idx[1] = 1'b1;
+                x2 = x4[3:2];
+            end else begin
+                x2 = x4[1:0];
+            end
+            idx[0] = x2[1];
+            topbit64 = idx;
         end
     endfunction
 
@@ -307,26 +373,45 @@ module msh_mla (
                     : 13'd0;
     assign xr1_addr = (state == ST_STORE) ? {j_vbuf, vs_src} : 13'd0;
 
-    integer l;
+    integer l, al;
     // datapath temps at TRUE value widths (multiplier operands stay
     // narrow+equal so yosys doesn't context-extend them to 80x80; see
     // ("unsigned-concat trap": zero-extend before mixing widths)
     reg signed [31:0] t_k, t_q;         // KV/q lanes (int32)
     reg signed [24:0] t_p;              // rs(e, 4): up to +2^23 (25b!)
-    reg signed [79:0] t_acc;
+    reg signed [79:0] t_acc, att_dot_n;
+    reg signed [63:0] att_mul;
+    reg [255:0] att_round_n, att_round_r, att_prod_v, att_prod_r;
+    reg signed [79:0] att_pair01, att_pair23;
     reg signed [55:0] t_a1;
     reg signed [45:0] t_a2;             // rs(acc_d 72b, 28)
     reg signed [79:0] att_acc_n, att_v;
     reg signed [56:0] t_diff;
-    reg signed [31:0] t_ei, t_b, t_idxc;
-    reg signed [39:0] t_interp;
-    reg [31:0]        t_f32;
-    reg [17:0]        t_frac;
-    reg [12:0]        e_idx;
-    reg [27:0]        e_y;
     reg [223:0]       ctx_prod_v;       // 4 x int56 (comb temp)
+    reg signed [183:0] ctx_a2_n, ctx_a2_r;
+    reg signed [227:0] ctx_pp_lo_n, ctx_pp_lo_r;
+    reg signed [223:0] ctx_pp_hi_n, ctx_pp_hi_r;
+    reg signed [271:0] ctx_prod_n, ctx_prod_r;
+    reg signed [55:0] ctx_finish;
+    reg [127:0] ctx_data_n;
     reg [127:0]       ctx_word;
+    reg [8:0] ctx_word_a_r, ctx_word_b_r, ctx_word_c_r, ctx_word_d_r;
+    reg ctx_valid_a, ctx_valid_b, ctx_valid_c, ctx_valid_d;
     wire signed [55:0] t_att_w = atb_rd[55:0];  // att word (macro read)
+
+    /* verilator lint_off WIDTHTRUNC */
+    /* verilator lint_off WIDTHEXPAND */
+    always @* begin
+        att_round_n = 256'd0;
+        for (al = 0; al < 4; al = al + 1) begin
+            att_round_n[64*al +: 32] =
+                rs80($signed(k_rd[32*al +: 32]), 7'd4);
+            att_round_n[64*al + 32 +: 32] =
+                rs80($signed(qword_r[32*al +: 32]), 7'd4);
+        end
+    end
+    /* verilator lint_on WIDTHEXPAND */
+    /* verilator lint_on WIDTHTRUNC */
 
     // acc_d RMW (read issued one cycle earlier with (t, w))
     reg [287:0] ad_wd_r;
@@ -342,68 +427,98 @@ module msh_mla (
     /* verilator lint_on WIDTHEXPAND */
     assign ad_wd = ad_wd_r;
     // recip
-    wire [5:0]        rc_e0   = topbit64(se);
-    wire signed [7:0] rc_E    = {2'b00, rc_e0} - 8'sd20;
-    wire [5:0]        rc_amt  = (rc_E >= 8'sd0) ? rc_E[5:0] : (6'd0 - rc_E[5:0]);
-    wire [63:0]       rc_mq   = (rc_E >= 8'sd0) ? (se >>> rc_amt)
-                                                : (se <<< rc_amt);
-    wire [11:0]       rc_idx  = rc_mq[20:9] - 12'd2048;
-    wire [8:0]        rc_frac = rc_mq[8:0];
-    wire signed [25:0] rc_di  = rd_c * $signed({1'b0, rc_frac});
-    wire signed [25:0] rc_r   = $signed({6'b0, rt_rd0[19:0]})
-                              + ((rc_di + 26'sd256) >>> 9);
-    wire signed [7:0] rc_sh   = 8'sd7 - rc_E;      // 46-30-(E+9)
-    wire [63:0]       rc_ru   = {38'b0, rc_r};
-    wire [63:0]       rec_n   = (rc_sh >= 8'sd0)
-                              ? (rc_ru <<< rc_sh[5:0])
-                              : ((rc_ru + (64'd1 <<< (6'd0 - rc_sh[5:0] - 6'd1)))
-                                 >>> (6'd0 - rc_sh[5:0]));
+    wire [63:0]       se_ext  = {28'b0, se};
+    wire [5:0] rc_e0_c = topbit64(se_ext);
+    wire signed [7:0] rc_E_c = {2'b00, rc_e0_c} - 8'sd20;
+    wire [5:0] rc_amt_c = (rc_E_c >= 8'sd0)
+                        ? rc_E_c[5:0] : (6'd0 - rc_E_c[5:0]);
+    wire [63:0] rc_mq_c = (rc_E_r >= 8'sd0) ? (se_ext >>> rc_amt_r)
+                                             : (se_ext <<< rc_amt_r);
+    wire [11:0] rc_idx_c = rc_mq_r[20:9] - 12'd2048;
+    wire [8:0] rc_frac_c = rc_mq_r[8:0];
+    wire signed [7:0] rc_sh_c = 8'sd7 - rc_E_r;  // 46-30-(E+9)
+    wire signed [25:0] rc_di_c = rd_c * $signed({1'b0, rc_frac_r});
+    wire signed [25:0] rc_r_c = $signed({6'b0, rc_base_r[19:0]})
+                              + ((rc_di_r + 26'sd256) >>> 9);
+    wire [63:0] rc_ru_c = {38'b0, rc_r_c};
+    wire [63:0] rec_n_c = (rc_sh_r >= 8'sd0)
+                        ? (rc_ru_r <<< rc_sh_r[5:0])
+                        : ((rc_ru_r + (64'd1 <<< (6'd0 - rc_sh_r[5:0] - 6'd1)))
+                           >>> (6'd0 - rc_sh_r[5:0]));
 
-    assign rom_e_idx = e_idx;
-    assign rom_r_idx = rc_idx;
+    assign rom_e_idx = exp_idx_r;
+    assign rom_r_idx = rc_idx_r;
+
+    wire signed [31:0] exp_ei_c = (exp_diff_r > 57'sd0) ? 32'sd0
+                                : (exp_diff_r < -57'sd1073741824)
+                                  ? -32'sd1073741824
+                                  : exp_diff_r[31:0];
+    wire signed [31:0] exp_tb_c = exp_ei_c >>> 18;
+    wire signed [31:0] exp_idxc_c = exp_tb_c + 32'sd4096;
+    wire [12:0] exp_idx_c = (exp_idxc_c < 32'sd0) ? 13'd0
+                           : (exp_idxc_c > 32'sd4096) ? 13'd4096
+                           : exp_idxc_c[12:0];
+    wire [17:0] exp_frac_c = exp_ei_c[17:0];
+    wire signed [39:0] exp_interp_c =
+        (exp_delta_r * $signed({1'b0, exp_frac2_r}) + 40'sd131072) >>> 18;
+    wire [27:0] exp_y_c = {1'b0, exp_base2_r[26:0]} + exp_interp_r[27:0];
 
     // rs80/sat32 return 80 bits; assignments to the true-width temps
     // intentionally truncate/extend (values always fit)
     /* verilator lint_off WIDTHTRUNC */
     /* verilator lint_off WIDTHEXPAND */
     always @* begin
-        // ---- att: acc += sum_l rs(K,4)*rs(q,4) ----
-        // (consumes the KV word returned for the delayed at_wd index)
-        t_acc = (at_wd == 6'd0) ? 80'sd0 : {{8{acc[71]}}, acc};
+        ctx_a2_n = 184'sd0;
+        ctx_pp_lo_n = 228'sd0;
+        ctx_pp_hi_n = 224'sd0;
+        ctx_prod_n = 272'sd0;
+        ctx_finish = 56'sd0;
+        ctx_data_n = 128'd0;
+        // ---- att dot-product stage: four rounded products and reduction ----
         for (l = 0; l < 4; l = l + 1) begin
-            t_k = rs80($signed(k_rd[32*l +: 32]), 7'd4);
-            t_q = rs80($signed(qbuf_v[32*{at_wd[3:0], l[1:0]} +: 32]), 7'd4);
-            t_acc = t_acc + t_k * t_q;
+            t_k = $signed(att_round_r[64*l +: 32]);
+            t_q = $signed(att_round_r[64*l + 32 +: 32]);
+            att_mul = $signed(t_k) * $signed(t_q);
+            att_prod_v[64*l +: 64] = att_mul;
         end
-        att_acc_n = t_acc;
-        t_a1 = rs80(t_acc, 7'd18);
+        att_pair01 = {{16{att_prod_r[63]}}, att_prod_r[63:0]}
+                   + {{16{att_prod_r[127]}}, att_prod_r[127:64]};
+        att_pair23 = {{16{att_prod_r[191]}}, att_prod_r[191:128]}
+                   + {{16{att_prod_r[255]}}, att_prod_r[255:192]};
+        t_acc = att_pair01 + att_pair23;
+        att_dot_n = t_acc;
+        // ---- attention accumulator stage ----
+        att_acc_n = att_dot_first ? att_dot_r
+                   : {{8{acc[71]}}, acc} + att_dot_r;
+        // ---- completed score scaling stage ----
+        t_a1 = rs80(att_acc_stage, 7'd18);
         att_v = rs80(t_a1 * $signed({1'b0, j_catt}), 7'd16);
-        // ---- exp: ei clip, LUT eval (async ROM read, same cycle) ----
+        // ---- exp input difference; the remaining stages are pipelined ----
         t_diff = {t_att_w[55], t_att_w} - {mx[55], mx};
-        if (t_diff > 57'sd0)                 t_ei = 32'sd0;
-        else if (t_diff < -57'sd1073741824)  t_ei = -32'sd1073741824;
-        else                                 t_ei = t_diff[31:0];
-        t_b    = t_ei >>> 18;
-        t_idxc = t_b + 32'sd4096;
-        if (t_idxc < 32'sd0)          e_idx = 13'd0;
-        else if (t_idxc > 32'sd4096)  e_idx = 13'd4096;
-        else                          e_idx = t_idxc[12:0];
-        t_f32  = t_ei - (t_b <<< 18);
-        t_frac = t_f32[17:0];
-        t_interp = (ed_c * $signed({1'b0, t_frac}) + 40'sd131072)
-                   >>> 18;
-        e_y = {1'b0, et_rd0[26:0]} + t_interp[27:0];
         // ---- ctx: per-lane products e4 * V (consumes returned V word) ----
         t_p = rs80({53'b0, eb_rd[26:0]}, 7'd4);
         for (l = 0; l < 4; l = l + 1) begin
             t_k = $signed(v_rd[32*l +: 32]);
             ctx_prod_v[56*l +: 56] = t_p * t_k;
         end
-        // ---- ctx writeout: sat32((rs(acc_d,28)*rec + 2^13) >> 14) ----
+        // ---- ctx writeout: rounded operand -> split multiply -> combine -> sat ----
         for (l = 0; l < 4; l = l + 1) begin
             t_a2 = rs80($signed(ad_rd[72*l +: 72]), 7'd28);
-            t_a1 = (t_a2 * $signed(rec_ext[47:0]) + 80'sd8192) >>> 14;
-            ctx_word[32*l +: 32] = sat32(t_a1);
+            ctx_a2_n[46*l +: 46] = t_a2;
+            ctx_pp_lo_n[57*l +: 57] =
+                $signed(ctx_a2_r[46*l +: 46])
+                * $signed({1'b0, rec_ctx[10:0]});
+            ctx_pp_hi_n[56*l +: 56] =
+                $signed(ctx_a2_r[46*l +: 46])
+                * $signed({1'b0, rec_ctx[20:11]});
+            ctx_prod_n[68*l +: 68] =
+                $signed({{1{ctx_pp_hi_r[56*l+55]}},
+                         ctx_pp_hi_r[56*l +: 56], 11'b0})
+                + $signed({{11{ctx_pp_lo_r[57*l+56]}},
+                           ctx_pp_lo_r[57*l +: 57]});
+            ctx_finish =
+                ($signed(ctx_prod_r[68*l +: 68]) + 68'sd8192) >>> 14;
+            ctx_data_n[32*l +: 32] = sat32(ctx_finish);
         end
     end
     /* verilator lint_on WIDTHEXPAND */
@@ -412,10 +527,13 @@ module msh_mla (
     // ctx write port (acc_d read is synchronous: the writeout fires
     // one cycle after the word index issue, with cw_wd)
     wire signed [79:0] rec_ext = {{32{rec[47]}}, rec};
+    // rec is non-negative and bounded below 2^21 by the reciprocal contract.
+    wire signed [21:0] rec_ctx = {1'b0, rec[20:0]};
     wire signed [79:0] mx_ext  = {{24{mx[55]}}, mx};
     wire [8:0] cw_word = ({7'b0, hd[1:0]} * {3'b0, j_nwv}) + {3'b0, cw_wd};
-    assign xw_we    = (state == ST_CTXW) && cw_dv;
-    assign xw_addr  = {j_cbuf, cw_word};
+    assign xw_we    = ((state == ST_CTXW) || (state == ST_CTXW_DRAIN))
+                    && ctx_valid_d;
+    assign xw_addr  = {j_cbuf, ctx_word_d_r};
     assign xw_data  = ctx_word;
     assign xw_wstrb = 4'b1111;
 
@@ -426,8 +544,8 @@ module msh_mla (
                      ks_caddr[13:11], vs_caddr[13:11],
                      et_rd0[31:27], et_rd1[31:27],
                      atb_rd[63:56], eb_rd[31:27], rec_ext[79:48],
-                     att_acc_n[79:72], att_v[79:56], t_interp[39:28],
-                     rc_mq[63:21], rec_n[63:48], t_f32[31:18]};
+                      att_acc_n[79:72], att_v[79:56], exp_interp_r[39:28],
+                      rc_mq_r[63:21], rec_n_c[63:48], exp_ei_c[31:18]};
 
     // ---------------- sequential process ----------------
     integer i;
@@ -454,7 +572,7 @@ module msh_mla (
             w        <= 6'd0;
             acc      <= 72'sd0;
             mx       <= 56'sd0;
-            se       <= 64'd0;
+        se       <= 36'd0;
             rec      <= 48'sd0;
             clr      <= 17'd0;
             ks_hd    <= 2'd0;
@@ -478,13 +596,166 @@ module msh_mla (
             q0_ph    <= 1'b0;
             q0_phd   <= 1'b0;
             q0_vd    <= 1'b0;
+            qword_r  <= 128'd0;
             att_iss  <= 1'b0;
             at_dv    <= 1'b0;
+            att_round_valid <= 1'b0;
+            att_mul_valid <= 1'b0;
+            att_dot_valid <= 1'b0;
+            att_acc_valid <= 1'b0;
+            att_round_first <= 1'b0;
+            att_round_last <= 1'b0;
+            att_round_tfirst <= 1'b0;
+            att_round_tlast <= 1'b0;
+            att_round_td <= 9'd0;
+            att_mul_first <= 1'b0;
+            att_mul_last <= 1'b0;
+            att_mul_tfirst <= 1'b0;
+            att_mul_tlast <= 1'b0;
+            att_mul_td <= 9'd0;
+            att_dot_first <= 1'b0;
+            att_dot_last  <= 1'b0;
+            att_dot_tfirst <= 1'b0;
+            att_dot_tlast <= 1'b0;
+            att_acc_last <= 1'b0;
+            att_acc_tfirst <= 1'b0;
+            att_acc_tlast <= 1'b0;
+            att_dot_td <= 9'd0;
+            att_acc_td <= 9'd0;
+            att_dot_r <= 80'sd0;
+            att_round_r <= 256'd0;
+            att_prod_r <= 256'd0;
+            att_acc_stage <= 80'sd0;
             ctx_iss  <= 1'b0;
             c_dv     <= 1'b0;
             e_dv     <= 1'b0;
+            exp_tag1_r <= 12'd0;
+            exp_tag2_r <= 12'd0;
+            exp_tag3_r <= 12'd0;
+            exp_tag4_r <= 12'd0;
+            exp_tag5_r <= 12'd0;
+            exp_diff_r <= 57'sd0;
+            exp_idx_r <= 13'd0;
+            exp_frac1_r <= 18'd0;
+            exp_frac2_r <= 18'd0;
+            exp_delta_r <= 33'sd0;
+            exp_base_r <= 32'd0;
+            exp_base2_r <= 32'd0;
+            exp_interp_r <= 40'sd0;
+            exp_y_r <= 28'd0;
+            recip_phase <= 3'd0;
+            rc_e0_r <= 6'd0;
+            rc_amt_r <= 6'd0;
+            rc_E_r <= 8'sd0;
+            rc_sh_r <= 8'sd0;
+            rc_mq_r <= 64'd0;
+            rc_ru_r <= 64'd0;
+            rc_idx_r <= 12'd0;
+            rc_frac_r <= 9'd0;
+            rc_base_r <= 24'd0;
+            rc_di_r <= 26'sd0;
+            rc_r_r <= 26'sd0;
             cw_dv    <= 1'b0;
+            ctx_a2_r <= 184'sd0;
+            ctx_pp_lo_r <= 228'sd0;
+            ctx_pp_hi_r <= 224'sd0;
+            ctx_prod_r <= 272'sd0;
+            ctx_word <= 128'd0;
+            ctx_word_a_r <= 9'd0;
+            ctx_word_b_r <= 9'd0;
+            ctx_word_c_r <= 9'd0;
+            ctx_word_d_r <= 9'd0;
+            ctx_valid_a <= 1'b0;
+            ctx_valid_b <= 1'b0;
+            ctx_valid_c <= 1'b0;
+            ctx_valid_d <= 1'b0;
         end else begin
+            ctx_valid_a <= (state == ST_CTXW) && cw_dv;
+            ctx_valid_b <= ctx_valid_a;
+            ctx_valid_c <= ctx_valid_b;
+            ctx_valid_d <= ctx_valid_c;
+            if ((state == ST_CTXW) && cw_dv) begin
+                ctx_a2_r <= ctx_a2_n;
+                ctx_word_a_r <= cw_word;
+            end
+            if (ctx_valid_a) begin
+                ctx_pp_lo_r <= ctx_pp_lo_n;
+                ctx_pp_hi_r <= ctx_pp_hi_n;
+                ctx_word_b_r <= ctx_word_a_r;
+            end
+            if (ctx_valid_b) begin
+                ctx_prod_r <= ctx_prod_n;
+                ctx_word_c_r <= ctx_word_b_r;
+            end
+            if (ctx_valid_c) begin
+                ctx_word <= ctx_data_n;
+                ctx_word_d_r <= ctx_word_c_r;
+            end
+`ifdef MSH_DEBUG
+            if (ctx_valid_d)
+                $display("[mla] ctxw out w=%0d word=%032x", ctx_word_d_r,
+                         ctx_word);
+`endif
+            exp_tag2_r <= exp_tag1_r;
+            exp_tag3_r <= exp_tag2_r;
+            exp_tag4_r <= exp_tag3_r;
+            exp_tag5_r <= exp_tag4_r;
+            if (exp_tag1_r[11]) begin
+                exp_idx_r <= exp_idx_c;
+                exp_frac1_r <= exp_frac_c;
+            end
+            if (exp_tag2_r[11]) begin
+                exp_delta_r <= ed_c;
+                exp_base_r <= et_rd0;
+                exp_frac2_r <= exp_frac1_r;
+            end
+            if (exp_tag3_r[11]) begin
+                exp_interp_r <= exp_interp_c;
+                exp_base2_r <= exp_base_r;
+            end
+            if (exp_tag4_r[11])
+                exp_y_r <= exp_y_c;
+
+            att_round_valid <= at_dv;
+            att_mul_valid <= att_round_valid;
+            att_dot_valid <= att_mul_valid;
+            att_acc_valid <= att_dot_valid;
+            if (at_dv) begin
+                att_round_r <= att_round_n;
+                att_round_first <= (at_wd == 6'd0);
+                att_round_last <= (at_wd == j_nwk - 6'd1);
+                att_round_tfirst <= (at_td == 9'd0);
+                att_round_tlast <= (at_td == j_pos);
+                att_round_td <= at_td;
+            end
+            if (att_round_valid) begin
+                att_prod_r <= att_prod_v;
+                att_mul_first <= att_round_first;
+                att_mul_last <= att_round_last;
+                att_mul_tfirst <= att_round_tfirst;
+                att_mul_tlast <= att_round_tlast;
+                att_mul_td <= att_round_td;
+            end
+            if (att_mul_valid) begin
+                att_dot_r <= att_dot_n;
+                att_dot_first <= att_mul_first;
+                att_dot_last <= att_mul_last;
+                att_dot_tfirst <= att_mul_tfirst;
+                att_dot_tlast <= att_mul_tlast;
+                att_dot_td <= att_mul_td;
+            end
+            if (att_dot_valid) begin
+                acc <= att_acc_n[71:0];
+                att_acc_stage <= att_acc_n;
+                att_acc_last <= att_dot_last;
+                att_acc_tfirst <= att_dot_tfirst;
+                att_acc_tlast <= att_dot_tlast;
+                att_acc_td <= att_dot_td;
+            end
+            if (att_acc_valid && att_acc_last) begin
+                if (att_acc_tfirst || (att_v > mx_ext))
+                    mx <= att_v[55:0];
+            end
             /* verilator lint_off BLKSEQ */
 `ifdef MSH_DEBUG
             if (state != ST_CLEAR)
@@ -631,6 +902,7 @@ module msh_mla (
                     at_dv <= 1'b1;
                     at_td <= t;
                     at_wd <= w;
+                    qword_r <= qbuf_v[128*w[3:0] +: 128];
                     if (w == j_nwk - 6'd1) begin
                         w <= 6'd0;
                         if (t == j_pos) att_iss <= 1'b1;
@@ -642,28 +914,37 @@ module msh_mla (
                     at_dv <= 1'b0;
                 end
                 if (at_dv) begin
-                    acc <= att_acc_n[71:0];
                     if (at_wd == j_nwk - 6'd1) begin
                         // att write is combinational (atb_we/atb_wd)
 `ifdef MSH_DEBUG
                         $display("[mla] att hd=%0d t=%0d acc=%0d att_v=%0d",
                                  hd, at_td, att_acc_n, att_v);
 `endif
-                        if ((at_td == 9'd0) || (att_v > mx_ext))
-                            mx <= att_v[55:0];
                         if (at_td == j_pos) begin
                             t       <= 9'd0;
                             att_iss <= 1'b0;
-                            state   <= ST_EXP;
+                            state   <= ST_ATT_FLUSH;
                         end
                     end
                 end
             end
 
+            ST_ATT_FLUSH: begin
+                if (att_acc_valid && att_acc_last && att_acc_tlast) begin
+                    t     <= 9'd0;
+                    e_dv  <= 1'b0;
+                    exp_tag1_r <= 12'd0;
+                    exp_tag2_r <= 12'd0;
+                    exp_tag3_r <= 12'd0;
+                    exp_tag4_r <= 12'd0;
+                    exp_tag5_r <= 12'd0;
+                    state <= ST_EXP;
+                end
+            end
+
             // -------- e[t] = exp(att[t]-mx), se = sum --------
-            // sync att read: issue t, consume the returned word next
-            // cycle with e_td (async ROM lookup keeps II=1); the e_buf
-            // macro write is combinational (eb_we/eb_waddr/eb_wd).
+            // Sync att reads feed an II=1 exp pipeline. The last tagged
+            // result both writes e_buf and ends the phase after draining.
             ST_EXP: begin
                 if ({1'b0, t} <= {1'b0, j_pos}) begin
                     e_dv <= 1'b1;
@@ -673,28 +954,72 @@ module msh_mla (
                     e_dv <= 1'b0;
                 end
                 if (e_dv) begin
+                    exp_diff_r <= t_diff;
+                    exp_tag1_r <= {1'b1, (e_td == 9'd0),
+                                   (e_td == j_pos), e_td};
 `ifdef MSH_DEBUG
-                    $display("[mla] exp hd=%0d t=%0d att=%0d mx=%0d ei=%0d idx=%0d e=%0d",
-                             hd, e_td, t_att_w, mx, t_ei, e_idx, e_y);
+                    $display("[mla] exp input hd=%0d t=%0d att=%0d mx=%0d diff=%0d",
+                             hd, e_td, t_att_w, mx, t_diff);
 `endif
-                    if (e_td == 9'd0) se <= {36'b0, e_y};
-                    else              se <= se + {36'b0, e_y};
-                    if (e_td == j_pos) begin
+                end else begin
+                    exp_tag1_r <= 12'd0;
+                end
+                if (exp_tag5_r[11]) begin
+`ifdef MSH_DEBUG
+                    $display("[mla] exp output hd=%0d t=%0d e=%0d",
+                             hd, exp_tag5_r[8:0], exp_y_r);
+`endif
+                    if (exp_tag5_r[10]) se <= {8'b0, exp_y_r};
+                    else                se <= se + {8'b0, exp_y_r};
+                    if (exp_tag5_r[9]) begin
                         t     <= 9'd0;
+                        recip_phase <= 3'd0;
                         state <= ST_RECIP;
                     end
                 end
             end
 
-            // -------- rec = recip(se) (async ROM read, same cycle) --------
+            // -------- rec = recip(se), staged around scalar arithmetic --------
             ST_RECIP: begin
-                rec   <= rec_n[47:0];
+                case (recip_phase)
+                3'd0: begin
+                    rc_e0_r <= rc_e0_c;
+                    rc_E_r <= rc_E_c;
+                    rc_amt_r <= rc_amt_c;
+                    recip_phase <= 3'd1;
+                end
+                3'd1: begin
+                    rc_mq_r <= rc_mq_c;
+                    recip_phase <= 3'd2;
+                end
+                3'd2: begin
+                    rc_idx_r <= rc_idx_c;
+                    rc_frac_r <= rc_frac_c;
+                    rc_sh_r <= rc_sh_c;
+                    recip_phase <= 3'd3;
+                end
+                3'd3: begin
+                    rc_di_r <= rc_di_c;
+                    rc_base_r <= rt_rd0;
+                    recip_phase <= 3'd4;
+                end
+                3'd4: begin
+                    rc_r_r <= rc_r_c;
+                    rc_ru_r <= rc_ru_c;
+                    recip_phase <= 3'd5;
+                end
+                default: begin
+                    rec <= rec_n_c[47:0];
+                    recip_phase <= 3'd0;
+                    w <= 6'd0;
+                    state <= ST_CTX;
 `ifdef MSH_DEBUG
-                $display("[mla] recip hd=%0d se=%0d e0=%0d E=%0d mq=%0d idx=%0d r=%0d sh=%0d rec=%0d",
-                         hd, se, rc_e0, rc_E, rc_mq, rc_idx, rc_r, rc_sh, rec_n);
+                    $display("[mla] recip hd=%0d se=%0d e0=%0d E=%0d mq=%0d idx=%0d r=%0d sh=%0d rec=%0d",
+                             hd, se, rc_e0_r, rc_E_r, rc_mq_r, rc_idx_r,
+                             rc_r_r, rc_sh_r, rec_n_c);
 `endif
-                w     <= 6'd0;
-                state <= ST_CTX;
+                end
+                endcase
             end
 
             // -------- acc_d += rs(e[t],4) * V[t][d] --------
@@ -735,25 +1060,29 @@ module msh_mla (
                     cw_dv <= 1'b0;
                 end
                 if (cw_dv) begin
-                    // xw_* are combinational this cycle (ctx_word from
-                    // the returned acc_d word)
 `ifdef MSH_DEBUG
-                    $display("[mla] ctxw hd=%0d w=%0d acc0=%0d acc1=%0d acc2=%0d acc3=%0d word=%032x",
+                    $display("[mla] ctxw in hd=%0d w=%0d acc0=%0d acc1=%0d acc2=%0d acc3=%0d",
                              hd, cw_wd,
                              ad_rd[72*0 +: 72], ad_rd[72*1 +: 72],
-                             ad_rd[72*2 +: 72], ad_rd[72*3 +: 72],
-                             ctx_word);
+                             ad_rd[72*2 +: 72], ad_rd[72*3 +: 72]);
 `endif
                     if (cw_wd == j_nwv[4:0] - 5'd1) begin
-                        if (hd == j_H - 4'd1) begin
-                            state <= ST_DONE;
-                        end else begin
-                            hd    <= hd + 4'd1;
-                            q0_w  <= 6'd0;
-                            q0_ph <= 1'b0;
-                            q0_vd <= 1'b0;
-                            state <= ST_QLOAD;
-                        end
+                        cw_dv <= 1'b0;
+                        state <= ST_CTXW_DRAIN;
+                    end
+                end
+            end
+
+            ST_CTXW_DRAIN: begin
+                if (!(ctx_valid_a || ctx_valid_b || ctx_valid_c || ctx_valid_d)) begin
+                    if (hd == j_H - 4'd1) begin
+                        state <= ST_DONE;
+                    end else begin
+                        hd    <= hd + 4'd1;
+                        q0_w  <= 6'd0;
+                        q0_ph <= 1'b0;
+                        q0_vd <= 1'b0;
+                        state <= ST_QLOAD;
                     end
                 end
             end
