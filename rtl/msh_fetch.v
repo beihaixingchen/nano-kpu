@@ -220,20 +220,22 @@ module msh_fetch (
     reg          hq_ld_dv;
     reg  [3:0]   hq_shift;              // seg_addr[3:0] at issue
     reg  [10:0]  hq_popb;               // beats popped so far
-    wire [10:0]  hq_rem   = hq_nbeats - hq_popb;   // beats left
+    reg  [10:0]  hq_rem;                // beats left, decremented on pop
+    reg          hq_nonempty;
+    reg          hq_first;              // first beat of the rewound span
     wire [9:0]   hq_nwords = hq_nbeats[10:1] + {9'b0, hq_nbeats[0]};
     // presentation (collapses through empty words; beat1 may straddle
     // into the second skid word)
     wire [1:0]   hq_pv_v = (hq_w0_v != 2'b00) ? hq_w0_v : hq_w1_v;
     wire [255:0] hq_pv_d = (hq_w0_v != 2'b00) ? hq_w0 : hq_w1;
-    assign      hq_v    = hq_fill_done && (hq_rem != 11'd0)
+    assign      hq_v    = hq_fill_done && hq_nonempty
                         && (hq_pv_v != 2'b00);
     assign      hq_v2   = (hq_pv_v == 2'b11) ? hq_v
                         : hq_v && (hq_w0_v != 2'b00) && (hq_w1_v != 2'b00);
     assign      hq_d0   = hq_pv_v[0] ? hq_pv_d[127:0] : hq_pv_d[255:128];
     assign      hq_d1   = (hq_pv_v == 2'b11) ? hq_pv_d[255:128]
                         : (hq_w1_v[0] ? hq_w1[127:0] : hq_w1[255:128]);
-    assign      hq_f0   = (hq_popb == 11'd0);
+    assign      hq_f0   = hq_first;
     assign      hq_l0   = (hq_rem == 11'd1);
     assign      hq_l1   = (hq_rem == 11'd2);
     assign      hq_sh0  = hq_f0 ? hq_shift : 4'd0;
@@ -285,6 +287,7 @@ module msh_fetch (
     reg [9:0] fill_ptr;  // slot filled when its response arrives (in order)
     reg [9:0] rd_ptr;    // prefetch pointer (advances into the out register)
     reg [6:0] sq_wr, sq_rd;
+    integer sq_slot;
 
     // reserved = in-flight reads + FIFO occupancy; the skid queue holds
     // loaded words in registers, not RAM slots
@@ -508,6 +511,9 @@ module msh_fetch (
             hq_shift    <= 4'd0;
             hq_rword    <= 9'd0;
             hq_popb     <= 11'd0;
+            hq_rem      <= 11'd0;
+            hq_nonempty <= 1'b0;
+            hq_first    <= 1'b1;
             hq_w0_v     <= 2'b00;
             hq_w1_v     <= 2'b00;
             hq_ld_dv    <= 1'b0;
@@ -523,9 +529,13 @@ module msh_fetch (
         end else begin
             // segment queue push
             if (seg_valid && seg_ready) begin
-                sq_addr_v[36*sq_wr[5:0] +: 36] <= seg_addr;
-                sq_len_v [32*sq_wr[5:0] +: 32] <= seg_len;
-                sq_tag_v [4*sq_wr[5:0] +: 4]   <= seg_tag;
+                for (sq_slot = 0; sq_slot < 64; sq_slot = sq_slot + 1) begin
+                    if (sq_wr[5:0] == sq_slot) begin
+                        sq_addr_v[36*sq_slot +: 36] <= seg_addr;
+                        sq_len_v [32*sq_slot +: 32] <= seg_len;
+                        sq_tag_v [4*sq_slot +: 4]   <= seg_tag;
+                    end
+                end
                 sq_wr <= sq_wr + 7'd1;
             end
             // in-order response fill (slot was allocated at request time;
@@ -592,6 +602,9 @@ module msh_fetch (
 `endif
             if (hq_rewind) begin
                 hq_popb  <= 11'd0;
+                hq_rem   <= hq_nbeats;
+                hq_nonempty <= (hq_nbeats != 11'd0);
+                hq_first <= 1'b1;
                 hq_rword <= 9'd0;
                 hq_w0_v  <= 2'b00;
                 hq_w1_v  <= 2'b00;
@@ -599,8 +612,17 @@ module msh_fetch (
             end else begin
                 hq_ld_dv <= hq_ld_fire;
                 if (hq_ld_fire) hq_rword <= hq_rword + 9'd1;
-                if (hq_pop2)      hq_popb <= hq_popb + 11'd2;
-                else if (hq_pop)  hq_popb <= hq_popb + 11'd1;
+                if (hq_pop2) begin
+                    hq_popb  <= hq_popb + 11'd2;
+                    hq_rem   <= hq_rem - 11'd2;
+                    hq_nonempty <= !hq_l1;
+                    hq_first <= 1'b0;
+                end else if (hq_pop) begin
+                    hq_popb  <= hq_popb + 11'd1;
+                    hq_rem   <= hq_rem - 11'd1;
+                    hq_nonempty <= !hq_l0;
+                    hq_first <= 1'b0;
+                end
                 hq_w0_v <= hq_nv0_v; hq_w0 <= hq_nd0;
                 hq_w1_v <= hq_nv1_v; hq_w1 <= hq_nd1;
             end
@@ -637,6 +659,8 @@ module msh_fetch (
                 if (iss_last) iss_active <= 1'b0;
                 if (hq_first_issue) begin
                     hq_nbeats <= iss_beats[10:0];
+                    hq_rem    <= iss_beats[10:0];
+                    hq_nonempty <= (iss_beats[10:0] != 11'd0);
                 end
 `ifdef MSH_DEBUG
                 if (iss_hq) dbg_hq_iss <= dbg_hq_iss + 16'd1;

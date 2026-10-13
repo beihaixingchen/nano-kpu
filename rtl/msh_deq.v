@@ -37,8 +37,8 @@ module msh_deq (
     output wire [3:0]   y_buf,
     output wire         done
 );
-    localparam S_IDLE = 3'd0, S_S = 3'd1, S_Z = 3'd2, S_Q = 3'd3,
-               S_WR = 3'd4;
+    localparam S_IDLE  = 3'd0, S_S = 3'd1, S_Z = 3'd2, S_Q = 3'd3,
+               S_WR    = 3'd4, S_WFLUSH = 3'd5, S_WDONE = 3'd6;
 
     reg [2:0]  state;
     reg [15:0] j_d;
@@ -56,8 +56,14 @@ module msh_deq (
     reg         beat_last;              // latched beat ends the segment
 
     reg [15:0] pos;                     // bytes consumed in current segment
-    reg [15:0] wr_i;                    // element index 0..d-1
-    reg [127:0] pack_v;                 // 4 x 32b
+    reg [15:0] wr_i;                    // first element index of output word
+    reg signed [5:0]  op_qz0_r, op_qz1_r, op_qz2_r, op_qz3_r;
+    reg signed [15:0] op_s0_r, op_s1_r, op_s2_r, op_s3_r;
+    reg                op_valid_r, op_last_r;
+    reg [11:0]         op_addr_r;
+    reg                out_valid_r, out_last_r;
+    reg [11:0]         out_addr_r;
+    reg [127:0]        out_data_r;
 
     assign job_ready = (state == S_IDLE);
     // byte-serial intake: accept a beat only when the previous one is
@@ -68,32 +74,57 @@ module msh_deq (
                         || (state == S_Q)) && emit_idle;
     wire ws_fire = ws_valid && ws_ready;
 
-    // dequant of element wr_i
-    wire [6:0]  w_j   = wr_i[7:1];
-    wire [7:0]  w_qb  = qrow_v[8*w_j +: 8];
-    wire [3:0]  w_nib = wr_i[0] ? w_qb[7:4] : w_qb[3:0];
-    wire        w_g   = (wr_i >= {8'b0, j_gsz});  // group (ng <= 2)
-    wire [7:0]  w_zb  = w_g ? zrow_v[15:8] : zrow_v[7:0];
-    wire signed [5:0]  w_qz  = $signed({2'b0, w_nib})
-                             - $signed({2'b0, w_zb[3:0]});
-    wire signed [15:0] w_s   = w_g ? $signed(srow_v[31:16])
-                                   : $signed(srow_v[15:0]);
-    wire signed [21:0] w_acc = w_qz * w_s;        // (q-z)*s, <= 15*32767
-    wire        w_ovf = (w_acc >  22'sd131071);   // (2^31-1) >> 14
-    wire        w_unf = (w_acc < -22'sd131072);
-    wire [31:0] w_y   = w_ovf ? 32'h7FFFFFFF
-                      : w_unf ? 32'h80000000
-                      : {w_acc[17:0], 14'b0};     // acc << 14
+    // Stage 1 selects the nibble, group zero-point and scale. Keeping the
+    // multiplier out of this stage is important for the 1 ns screen.
+    function automatic [21:0] deq_operands(input [15:0] idx);
+        reg [6:0]  f_j;
+        reg [7:0]  f_qb;
+        reg [3:0]  f_nib;
+        reg        f_g;
+        reg [7:0]  f_zb;
+        reg signed [5:0]  f_qz;
+        reg signed [15:0] f_s;
+        begin
+            f_j   = idx[7:1];
+            f_qb  = qrow_v[8*f_j +: 8];
+            f_nib = idx[0] ? f_qb[7:4] : f_qb[3:0];
+            f_g   = (idx >= {8'b0, j_gsz});
+            f_zb  = f_g ? zrow_v[15:8] : zrow_v[7:0];
+            f_qz  = $signed({2'b0, f_nib}) - $signed({2'b0, f_zb[3:0]});
+            f_s   = f_g ? $signed(srow_v[31:16]) : $signed(srow_v[15:0]);
+            deq_operands = {f_s, f_qz};
+        end
+    endfunction
 
-    assign y_we   = (state == S_WR) && (wr_i[1:0] == 2'd3);
-    assign y_addr = {6'b0, wr_i[7:2]};
-    assign y_data = {w_y, pack_v[95:0]};
+    function automatic [31:0] deq_product(
+        input signed [5:0]  f_qz,
+        input signed [15:0] f_s);
+        reg signed [21:0] f_acc;
+        begin
+            f_acc = f_qz * f_s;
+            if (f_acc > 22'sd131071)
+                deq_product = 32'h7FFFFFFF;
+            else if (f_acc < -22'sd131072)
+                deq_product = 32'h80000000;
+            else
+                deq_product = {f_acc[17:0], 14'b0};
+        end
+    endfunction
+
+    wire [21:0] w_op0 = deq_operands(wr_i);
+    wire [21:0] w_op1 = deq_operands(wr_i + 16'd1);
+    wire [21:0] w_op2 = deq_operands(wr_i + 16'd2);
+    wire [21:0] w_op3 = deq_operands(wr_i + 16'd3);
+    wire [31:0] w_y0 = deq_product(op_qz0_r, op_s0_r);
+    wire [31:0] w_y1 = deq_product(op_qz1_r, op_s1_r);
+    wire [31:0] w_y2 = deq_product(op_qz2_r, op_s2_r);
+    wire [31:0] w_y3 = deq_product(op_qz3_r, op_s3_r);
+
+    assign y_we   = out_valid_r;
+    assign y_addr = out_addr_r;
+    assign y_data = out_data_r;
     assign y_buf  = j_ybuf;
-    assign done   = (state == S_WR) && (wr_i == j_d - 16'd1);
-
-    // pack_v[3] is never read (y_data emits w_y directly for the top
-    // lane); z bytes carry their value in the low nibble only
-    wire _unused = &{1'b0, pack_v[127:96], w_zb[7:4]};
+    assign done   = out_valid_r && out_last_r;
 `ifdef MSH_DEBUG
     always @(posedge clk) begin
         if (job_valid || state != S_IDLE || y_we)
@@ -112,7 +143,25 @@ module msh_deq (
             wr_i   <= 16'd0;
             beat_cnt  <= 5'd0;
             beat_last <= 1'b0;
+            op_qz0_r <= 6'sd0;
+            op_qz1_r <= 6'sd0;
+            op_qz2_r <= 6'sd0;
+            op_qz3_r <= 6'sd0;
+            op_s0_r  <= 16'sd0;
+            op_s1_r  <= 16'sd0;
+            op_s2_r  <= 16'sd0;
+            op_s3_r  <= 16'sd0;
+            op_valid_r <= 1'b0;
+            op_last_r  <= 1'b0;
+            op_addr_r  <= 12'd0;
+            out_valid_r <= 1'b0;
+            out_last_r  <= 1'b0;
+            out_addr_r  <= 12'd0;
+            out_data_r  <= 128'd0;
         end else begin
+            out_valid_r <= 1'b0;
+            out_last_r  <= 1'b0;
+
             // -------- beat latch (one beat in flight) --------
             if (ws_fire) begin
                 beat_r    <= ws_data >> {ws_shift, 3'b000};
@@ -120,33 +169,85 @@ module msh_deq (
                 beat_last <= ws_last;
             end
 
-            // -------- serial byte emit (1 byte/cycle) --------
+            // -------- four-byte beat emit --------
             if (beat_cnt != 5'd0) begin
                 if (state == S_Q) begin
                     qrow_v[8*pos[6:0] +: 8] <= beat_r[7:0];
+                    if (beat_cnt > 5'd1)
+                        qrow_v[8*(pos[6:0] + 7'd1) +: 8] <= beat_r[15:8];
+                    if (beat_cnt > 5'd2)
+                        qrow_v[8*(pos[6:0] + 7'd2) +: 8] <= beat_r[23:16];
+                    if (beat_cnt > 5'd3)
+                        qrow_v[8*(pos[6:0] + 7'd3) +: 8] <= beat_r[31:24];
                 end else if (state == S_S) begin
-                    if (pos[0] == 1'b0)
-                        srow_v[16*pos[1] +: 8]   <= beat_r[7:0];
-                    else
-                        srow_v[16*pos[1]+8 +: 8] <= beat_r[7:0];
+                    srow_v[8*pos[1:0] +: 8] <= beat_r[7:0];
+                    if (beat_cnt > 5'd1)
+                        srow_v[8*(pos[1:0] + 2'd1) +: 8] <= beat_r[15:8];
+                    if (beat_cnt > 5'd2)
+                        srow_v[8*(pos[1:0] + 2'd2) +: 8] <= beat_r[23:16];
+                    if (beat_cnt > 5'd3)
+                        srow_v[8*(pos[1:0] + 2'd3) +: 8] <= beat_r[31:24];
                 end else begin
                     zrow_v[8*pos[0] +: 8] <= beat_r[7:0];
+                    if (beat_cnt > 5'd1)
+                        zrow_v[8*(pos[0] + 1'b1) +: 8] <= beat_r[15:8];
                 end
-                beat_r   <= {8'b0, beat_r[127:8]};
-                beat_cnt <= beat_cnt - 5'd1;
-                pos      <= pos + 16'd1;
-                if ((beat_cnt == 5'd1) && beat_last) begin
+                if (beat_cnt > 5'd4) begin
+                    beat_r   <= {32'b0, beat_r[127:32]};
+                    beat_cnt <= beat_cnt - 5'd4;
+                    pos      <= pos + 16'd4;
+                end else begin
+                    beat_r   <= 128'd0;
+                    beat_cnt <= 5'd0;
+                    pos      <= pos + {11'd0, beat_cnt};
+                end
+                if ((beat_cnt <= 5'd4) && beat_last) begin
                     pos   <= 16'd0;
                     wr_i  <= 16'd0;
+                    op_valid_r <= 1'b0;
                     state <= (state == S_S) ? S_Z
                            : (state == S_Z) ? S_Q : S_WR;
                 end
             end
 
             if (state == S_WR) begin
-                pack_v[32*wr_i[1:0] +: 32] <= w_y;
-                if (wr_i == j_d - 16'd1) state <= S_IDLE;
-                else                     wr_i  <= wr_i + 16'd1;
+                // Stage 2 emits the previous word while stage 1 captures the
+                // next four operands. This keeps one output word/cycle while
+                // removing the variable-index muxes from the multiplier path.
+                if (op_valid_r) begin
+                    out_valid_r <= 1'b1;
+                    out_last_r  <= op_last_r;
+                    out_addr_r  <= op_addr_r;
+                    out_data_r  <= {w_y3, w_y2, w_y1, w_y0};
+                end
+                op_qz0_r <= $signed(w_op0[5:0]);
+                op_qz1_r <= $signed(w_op1[5:0]);
+                op_qz2_r <= $signed(w_op2[5:0]);
+                op_qz3_r <= $signed(w_op3[5:0]);
+                op_s0_r  <= $signed(w_op0[21:6]);
+                op_s1_r  <= $signed(w_op1[21:6]);
+                op_s2_r  <= $signed(w_op2[21:6]);
+                op_s3_r  <= $signed(w_op3[21:6]);
+                op_valid_r <= 1'b1;
+                op_last_r  <= (wr_i + 16'd4 >= j_d);
+                op_addr_r  <= {2'b0, wr_i[11:2]};
+                if (wr_i + 16'd4 >= j_d) state <= S_WFLUSH;
+                else                     wr_i  <= wr_i + 16'd4;
+            end
+
+            if (state == S_WFLUSH) begin
+                if (op_valid_r) begin
+                    out_valid_r <= 1'b1;
+                    out_last_r  <= op_last_r;
+                    out_addr_r  <= op_addr_r;
+                    out_data_r  <= {w_y3, w_y2, w_y1, w_y0};
+                end
+                op_valid_r <= 1'b0;
+                state <= S_WDONE;
+            end
+
+            if (state == S_WDONE) begin
+                state <= S_IDLE;
             end
 
             if ((state == S_IDLE) && job_valid) begin
@@ -154,6 +255,7 @@ module msh_deq (
                 j_gsz  <= job_gsz;
                 j_ybuf <= job_ybuf;
                 pos    <= 16'd0;
+                op_valid_r <= 1'b0;
                 state  <= S_S;
             end
         end
