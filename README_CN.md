@@ -2,6 +2,13 @@
 
 **语言：** [English](README.md) | 简体中文
 
+[![优化执行：GPT-6 Luna](https://img.shields.io/badge/Optimizer-GPT--6_Luna-8957E5?style=for-the-badge)](https://github.com/beihaixingchen)
+[![迭代：V0-V73](https://img.shields.io/badge/Iterations-V0--V73-2563EB?style=for-the-badge)](#优化归属)
+[![推导吞吐：36.82K tok/s](https://img.shields.io/badge/Derived_tok%2Fs-36.82K-16A34A?style=for-the-badge)](#优化结果)
+[![综合估算Fmax：442.923 MHz](https://img.shields.io/badge/ABC_Fmax-442.923_MHz-F97316?style=for-the-badge)](#指标范围)
+[![Full P0及6组严格对照：通过](https://img.shields.io/badge/Validation-P0_%2B_6_strict_cases-0F766E?style=for-the-badge)](#正确性验证)
+[![许可证：Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-6B7280?style=for-the-badge)](LICENSE)
+
 这是 [MoonshotAI/nano-kpu](https://github.com/MoonshotAI/nano-kpu) 的个人 RTL
 优化 fork。上游设计及原始归属保持不变；本 fork 发布了覆盖 7 个 RTL 模块的
 V73 优化候选。
